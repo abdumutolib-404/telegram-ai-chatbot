@@ -1,0 +1,29 @@
+{
+  "name": "telegram-ai-chatbot",
+  "version": "1.0.0",
+  "description": "Professional Telegram AI Chatbot with OpenRouter integration",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "chalk": "^5.3.0",
+    "date-fns": "^3.0.6",
+    "dotenv": "^16.3.1",
+    "pnpm": "^10.12.4",
+    "sqlite3": "^5.1.6",
+    "telegraf": "^4.15.6",
+    "yarn": "^1.22.22"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "@types/sqlite3": "^3.1.11",
+    "tsx": "^4.6.2",
+    "typescript": "^5.3.3"
+  }
+}
