@@ -8,539 +8,727 @@ import { statsService } from "./services/stats.js";
 import { modelService } from "./services/model.js";
 import { broadcastService } from "./services/broadcast.js";
 import { promocodeService } from "./services/promocode.js";
-import { ADMIN_IDS, BOT_TOKEN } from "./config/constants.js";
+import { rateLimitService } from "./services/rateLimit.js";
+import {
+  ADMIN_IDS,
+  BOT_TOKEN,
+  TELEGRAM_API_TIMEOUT,
+} from "./config/constants.js";
 import { BotContext } from "./types/bot.js";
+import { KeyboardBuilder, validateKeyboard } from "./utils/keyboard.js";
 import { logger } from "./utils/logger.js";
+import { TelegramFormatter } from "./utils/formatter.js";
 
-const bot = new Telegraf<BotContext>(BOT_TOKEN);
+// Validate bot token before creating instance
+if (!BOT_TOKEN) {
+  logger.error("BOT_TOKEN is missing from environment variables");
+  process.exit(1);
+}
+
+const bot = new Telegraf<BotContext>(BOT_TOKEN, {
+  telegram: {
+    apiRoot: "https://api.telegram.org",
+    agent: undefined,
+    webhookReply: false,
+  },
+});
 
 // Chat mode tracking
 const chatModeUsers = new Set<number>();
 
+// Session storage for registration
+const userSessions = new Map<number, any>();
+
+// Helper function to get message type safely
+function getMessageType(ctx: Context): string {
+  if (!ctx.message) return "other";
+
+  if ("text" in ctx.message) return "text";
+  if ("photo" in ctx.message) return "photo";
+  if ("video" in ctx.message) return "video";
+  if ("document" in ctx.message) return "document";
+  if ("animation" in ctx.message) return "animation";
+  if (ctx.callbackQuery) return "callback";
+
+  return "other";
+}
+
+// Helper function to get media type safely
+function getMediaType(message: any): string {
+  if ("photo" in message) return "photo";
+  if ("video" in message) return "video";
+  if ("animation" in message) return "animation";
+  if ("document" in message) return "document";
+  return "other";
+}
+
+// Helper function to send formatted message with proper edit/reply logic
+async function sendFormattedMessage(
+  ctx: any,
+  text: string,
+  keyboard?: any,
+  forceReply = false
+): Promise<any> {
+  try {
+    const options: any = {};
+
+    // Add keyboard if provided and valid
+    if (keyboard && validateKeyboard(keyboard)) {
+      options.reply_markup = keyboard.reply_markup;
+    }
+
+    // Determine whether to edit or reply
+    const shouldEdit =
+      !forceReply && ctx.callbackQuery && ctx.callbackQuery.message;
+
+    // Try HTML first (more reliable than Markdown V2)
+    try {
+      const htmlText = TelegramFormatter.toHTML(text);
+      options.parse_mode = "HTML";
+
+      if (shouldEdit) {
+        return await ctx.editMessageText(htmlText, options);
+      } else {
+        return await ctx.reply(htmlText, options);
+      }
+    } catch (htmlError) {
+      // Fallback to plain text
+      logger.warning("HTML formatting failed, using plain text", {
+        error: htmlError instanceof Error ? htmlError.message : "Unknown error",
+      });
+
+      const plainText = TelegramFormatter.toPlainText(text);
+      delete options.parse_mode;
+
+      if (shouldEdit) {
+        return await ctx.editMessageText(plainText, options);
+      } else {
+        return await ctx.reply(plainText, options);
+      }
+    }
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Failed to send message", { error: errorMessage });
+
+    // Last resort - try simple reply without any formatting
+    try {
+      const plainText = TelegramFormatter.toPlainText(text);
+      return await ctx.reply(plainText);
+    } catch (finalError) {
+      logger.error("Failed to send even simple message", {
+        error:
+          finalError instanceof Error ? finalError.message : "Unknown error",
+      });
+      throw finalError;
+    }
+  }
+}
+
 // Middleware - foydalanuvchini ro'yxatdan o'tkazish
 bot.use(async (ctx, next) => {
   if (ctx.from) {
-    await userService.ensureUser(ctx.from);
-    logger.user(`User activity: ${ctx.from.first_name}`, {
-      user_id: ctx.from.id,
-      username: ctx.from.username,
-      message_type: ctx.message?.text
-        ? "text"
-        : ctx.callbackQuery
-        ? "callback"
-        : "other",
-      chat_type: ctx.chat?.type,
-    });
+    try {
+      await userService.ensureUser(ctx.from);
+      logger.user(`User activity: ${ctx.from.first_name}`, {
+        user_id: ctx.from.id,
+        username: ctx.from.username,
+        message_type: getMessageType(ctx),
+        chat_type: ctx.chat?.type,
+      });
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Middleware error", {
+        error: errorMessage,
+        user_id: ctx.from.id,
+      });
+    }
   }
   return next();
 });
 
 // /start buyrug'i
 bot.start(async (ctx) => {
-  logger.info(`Start command`, {
-    user_id: ctx.from!.id,
-    name: ctx.from!.first_name,
-  });
+  try {
+    logger.info(`Start command`, {
+      user_id: ctx.from!.id,
+      name: ctx.from!.first_name,
+    });
 
-  const user = await userService.getUser(ctx.from!.id);
+    const user = await userService.getUser(ctx.from!.id);
 
-  // Ro'yxatdan o'tish tekshiruvi
-  if (!user?.registration_completed) {
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback("📝 Ro'yxatdan o'tish", "start_registration")],
-      [Markup.button.callback("⏭️ O'tkazib yuborish", "skip_registration")],
-    ]);
+    // Ro'yxatdan o'tish tekshiruvi
+    if (!user?.registration_completed) {
+      const keyboard = KeyboardBuilder.createRegistrationMenu();
+      const welcomeText = TelegramFormatter.formatWelcomeNew(
+        ctx.from!.first_name
+      );
 
-    return ctx.reply(
-      `🎉 Assalomu alaykum, ${ctx.from!.first_name}!\n\n` +
-        `🤖 Men AI chatbot man. Sizga turli AI modellari bilan suhbatlashishda yordam beraman.\n\n` +
-        `📝 Yaxshiroq xizmat ko'rsatish uchun qisqacha ma'lumot bering yoki o'tkazib yuboring.`,
-      keyboard
+      return await sendFormattedMessage(ctx, welcomeText, keyboard, true);
+    }
+
+    const keyboard = KeyboardBuilder.createMainMenu(
+      ADMIN_IDS.includes(ctx.from!.id)
+    );
+    const welcomeText = TelegramFormatter.formatWelcome(
+      ctx.from!.first_name,
+      ctx.from!.id
+    );
+
+    await sendFormattedMessage(ctx, welcomeText, keyboard, true);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Start command error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError(
+        "Xatolik yuz berdi. Iltimos, qayta urinib ko'ring."
+      ),
+      undefined,
+      true
     );
   }
+});
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("💬 Suhbat boshlash", "start_chat")],
-    [Markup.button.callback("🤖 Model tanlash", "select_model")],
-    [
-      Markup.button.callback("📊 Statistika", "stats"),
-      Markup.button.callback("💰 Balans", "balance"),
-    ],
-    [Markup.button.callback("🎫 Promokod", "use_promocode")],
-    ...(ADMIN_IDS.includes(ctx.from!.id)
-      ? [[Markup.button.callback("⚙️ Admin Panel", "admin_panel")]]
-      : []),
-  ]);
+// Registration handlers
+bot.action("start_registration", async (ctx) => {
+  try {
+    logger.info(`Registration started`, { user_id: ctx.from!.id });
+    userSessions.set(ctx.from!.id, { step: "name" });
 
-  await ctx.reply(
-    `🎉 Assalomu alaykum, ${ctx.from!.first_name}!\n\n` +
-      `🤖 Men AI chatbot man. Sizga turli AI modellari bilan suhbatlashishda yordam beraman.\n\n` +
-      `📝 Guruhda: Reply yoki @mention qiling\n` +
-      `💬 Shaxsiy chatda: "Suhbat boshlash" tugmasini bosing\n\n` +
-      `🆔 Sizning ID: ${ctx.from!.id}`,
-    keyboard
-  );
+    const keyboard = new KeyboardBuilder()
+      .addButton("⏭️ O'tkazib yuborish", "skip_name")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text = TelegramFormatter.formatRegistrationStep("name");
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Registration start error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("skip_name", async (ctx) => {
+  try {
+    userSessions.set(ctx.from!.id, { step: "age" });
+
+    const keyboard = new KeyboardBuilder()
+      .addButton("⏭️ O'tkazib yuborish", "skip_age")
+      .addButton("⬅️ Orqaga", "start_registration")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text = TelegramFormatter.formatRegistrationStep("age");
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Skip name error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("skip_age", async (ctx) => {
+  try {
+    userSessions.set(ctx.from!.id, { step: "interests" });
+
+    const keyboard = new KeyboardBuilder()
+      .addButton("⏭️ O'tkazib yuborish", "complete_registration")
+      .addButton("⬅️ Orqaga", "skip_name")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text = TelegramFormatter.formatRegistrationStep("interests");
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Skip age error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("complete_registration", async (ctx) => {
+  try {
+    logger.success(`Registration completed`, { user_id: ctx.from!.id });
+    await userService.completeRegistration(ctx.from!.id);
+    userSessions.delete(ctx.from!.id);
+
+    const keyboard = KeyboardBuilder.createMainMenu(
+      ADMIN_IDS.includes(ctx.from!.id)
+    );
+    const text = TelegramFormatter.formatRegistrationComplete(ctx.from!.id);
+
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Complete registration error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("skip_registration", async (ctx) => {
+  try {
+    logger.success(`Registration skipped`, { user_id: ctx.from!.id });
+    await userService.completeRegistration(ctx.from!.id);
+    userSessions.delete(ctx.from!.id);
+
+    const keyboard = KeyboardBuilder.createMainMenu(
+      ADMIN_IDS.includes(ctx.from!.id)
+    );
+    const text = TelegramFormatter.formatRegistrationSkipped(ctx.from!.id);
+
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Skip registration error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("back_to_main", async (ctx) => {
+  try {
+    userSessions.delete(ctx.from!.id);
+    chatModeUsers.delete(ctx.from!.id);
+
+    const keyboard = KeyboardBuilder.createMainMenu(
+      ADMIN_IDS.includes(ctx.from!.id)
+    );
+    const welcomeText = TelegramFormatter.formatWelcome(
+      ctx.from!.first_name,
+      ctx.from!.id
+    );
+
+    await sendFormattedMessage(ctx, welcomeText, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Back to main error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
 });
 
 // Chat mode handlers
 bot.action("start_chat", async (ctx) => {
-  const user = await userService.getUser(ctx.from!.id);
-  if (!user?.selected_model) {
-    return ctx.editMessageText(
-      "❌ Avval AI modelni tanlang!",
-      Markup.inlineKeyboard([
-        [Markup.button.callback("🤖 Model tanlash", "select_model")],
-        [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-      ])
+  try {
+    const user = await userService.getUser(ctx.from!.id);
+    if (!user?.selected_model) {
+      const keyboard = new KeyboardBuilder()
+        .addButton("🤖 Model tanlash", "select_model")
+        .addButton("🏠 Bosh sahifa", "back_to_main")
+        .build();
+
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError("Avval AI modelni tanlang!"),
+        keyboard
+      );
+    }
+
+    chatModeUsers.add(ctx.from!.id);
+    logger.info(`Chat mode started`, { user_id: ctx.from!.id });
+
+    const chatModeText = TelegramFormatter.formatChatModeStart(
+      user.selected_model
+    );
+    await sendFormattedMessage(ctx, chatModeText);
+
+    // Send keyboard separately to avoid inline keyboard error
+    await ctx.reply("🔚 Suhbatni tugatish uchun tugmani bosing:", {
+      reply_markup: {
+        keyboard: [[{ text: "🔚 Suhbatni tugatish" }]],
+        resize_keyboard: true,
+        one_time_keyboard: false,
+      },
+    });
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Start chat error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError(
+        "Suhbat rejimini yoqishda xatolik yuz berdi."
+      ),
+      undefined,
+      true
     );
   }
+});
 
-  chatModeUsers.add(ctx.from!.id);
-  logger.info(`Chat mode started`, { user_id: ctx.from!.id });
+// Model selection handlers
+bot.action("select_model", async (ctx) => {
+  try {
+    const models = await modelService.getActiveModels();
+    const user = await userService.getUser(ctx.from!.id);
 
-  // 1. Edit the message with an inline keyboard (required by Telegram)
-  await ctx.editMessageText(
-    `💬 Suhbat rejimi yoqildi!\n\n` +
-      `🤖 Tanlangan model: ${user.selected_model}\n\n` +
-      `📝 Endi har qanday xabar yozsangiz, AI javob beradi.\n` +
-      `🔚 Suhbatni tugatish uchun "Suhbatni tugatish" tugmasini bosing.`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
+    if (models.length === 0) {
+      const keyboard = KeyboardBuilder.createBackButton();
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError("Hozirda faol modellar mavjud emas."),
+        keyboard
+      );
+    }
 
-  // 2. Send a new message with a reply keyboard for chat mode
-  await ctx.reply("🔚 Suhbatni tugatish uchun quyidagi tugmani bosing.", {
-    reply_markup: {
-      keyboard: [[{ text: "🔚 Suhbatni tugatish" }]],
-      resize_keyboard: true,
-      one_time_keyboard: false,
-    },
-  });
+    // Modellarni 10 tadan ko'rsatish
+    const keyboard = new KeyboardBuilder();
+
+    models.slice(0, 10).forEach((model, index) => {
+      keyboard.addButton(
+        `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
+        `model_${index}`
+      );
+    });
+
+    if (models.length > 10) {
+      keyboard.addButton("➡️ Keyingi", "models_next_0");
+    }
+
+    keyboard.addButton("🏠 Bosh sahifa", "back_to_main");
+
+    await sendFormattedMessage(ctx, "🤖 AI modelni tanlang:", keyboard.build());
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Select model error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Modellarni yuklashda xatolik yuz berdi."),
+      undefined,
+      true
+    );
+  }
+});
+
+// Model tanlash (index bo'yicha)
+bot.action(/model_(\d+)/, async (ctx) => {
+  try {
+    const modelIndex = parseInt(ctx.match[1]);
+    const models = await modelService.getActiveModels();
+    const model = models[modelIndex];
+
+    if (!model) {
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError("Model topilmadi!")
+      );
+    }
+
+    await userService.updateSelectedModel(ctx.from!.id, model.id);
+    logger.success(`Model selected`, {
+      user_id: ctx.from!.id,
+      model: model.name,
+    });
+
+    const keyboard = KeyboardBuilder.createBackButton();
+    const text = TelegramFormatter.formatModelSelected(model.name);
+
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Model selection error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Model tanlashda xatolik yuz berdi."),
+      undefined,
+      true
+    );
+  }
+});
+
+// Modellar sahifalash
+bot.action(/models_next_(\d+)/, async (ctx) => {
+  try {
+    const page = parseInt(ctx.match[1]);
+    const models = await modelService.getActiveModels();
+    const user = await userService.getUser(ctx.from!.id);
+
+    const startIndex = (page + 1) * 10;
+    const endIndex = Math.min(startIndex + 10, models.length);
+    const pageModels = models.slice(startIndex, endIndex);
+
+    const keyboard = new KeyboardBuilder();
+
+    if (page >= 0) {
+      keyboard.addButton("⬅️ Oldingi", `models_prev_${page + 1}`);
+    }
+
+    pageModels.forEach((model, index) => {
+      keyboard.addButton(
+        `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
+        `model_${startIndex + index}`
+      );
+    });
+
+    if (endIndex < models.length) {
+      keyboard.addButton("➡️ Keyingi", `models_next_${page + 1}`);
+    }
+
+    keyboard.addButton("🏠 Bosh sahifa", "back_to_main");
+
+    await sendFormattedMessage(ctx, "🤖 AI modelni tanlang:", keyboard.build());
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Models pagination error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action(/models_prev_(\d+)/, async (ctx) => {
+  try {
+    const page = parseInt(ctx.match[1]) - 1;
+    const models = await modelService.getActiveModels();
+    const user = await userService.getUser(ctx.from!.id);
+
+    const startIndex = page * 10;
+    const endIndex = Math.min(startIndex + 10, models.length);
+    const pageModels = models.slice(startIndex, endIndex);
+
+    const keyboard = new KeyboardBuilder();
+
+    if (page > 0) {
+      keyboard.addButton("⬅️ Oldingi", `models_prev_${page}`);
+    }
+
+    pageModels.forEach((model, index) => {
+      keyboard.addButton(
+        `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
+        `model_${startIndex + index}`
+      );
+    });
+
+    if (endIndex < models.length) {
+      keyboard.addButton("➡️ Keyingi", `models_next_${page + 1}`);
+    }
+
+    keyboard.addButton("🏠 Bosh sahifa", "back_to_main");
+
+    await sendFormattedMessage(ctx, "🤖 AI modelni tanlang:", keyboard.build());
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Models pagination error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
 });
 
 // Chat mode end handler
 bot.hears("🔚 Suhbatni tugatish", async (ctx) => {
-  if (chatModeUsers.has(ctx.from!.id)) {
-    chatModeUsers.delete(ctx.from!.id);
-    logger.info(`Chat mode ended`, { user_id: ctx.from!.id });
+  try {
+    if (chatModeUsers.has(ctx.from!.id)) {
+      chatModeUsers.delete(ctx.from!.id);
+      logger.info(`Chat mode ended`, { user_id: ctx.from!.id });
 
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback("💬 Suhbat boshlash", "start_chat")],
-      [Markup.button.callback("🤖 Model tanlash", "select_model")],
-      [
-        Markup.button.callback("📊 Statistika", "stats"),
-        Markup.button.callback("💰 Balans", "balance"),
-      ],
-      [Markup.button.callback("🎫 Promokod", "use_promocode")],
-      ...(ADMIN_IDS.includes(ctx.from!.id)
-        ? [[Markup.button.callback("⚙️ Admin Panel", "admin_panel")]]
-        : []),
-    ]);
+      const keyboard = KeyboardBuilder.createMainMenu(
+        ADMIN_IDS.includes(ctx.from!.id)
+      );
+      const endChatText = TelegramFormatter.formatChatModeEnd();
 
-    await ctx.reply(
-      `✅ Suhbat rejimi tugatildi!\n\n` + `🏠 Asosiy menyuga qaytdingiz.`,
-      { ...keyboard, reply_markup: { remove_keyboard: true } }
-    );
-  }
-});
-
-// Ro'yxatdan o'tish jarayoni
-bot.action("start_registration", async (ctx) => {
-  logger.info(`Registration started`, { user_id: ctx.from!.id });
-  ctx.session = { step: "name" };
-  await ctx.editMessageText(
-    "👤 Ismingizni kiriting:\n\n" +
-      "💡 Bu ma'lumot sizga shaxsiylashtirilgan javoblar berish uchun kerak.",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⏭️ O'tkazib yuborish", "skip_name")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("skip_name", async (ctx) => {
-  ctx.session = { step: "age" };
-  await ctx.editMessageText(
-    "👤 Yoshingizni kiriting (masalan: 25):\n\n" +
-      "💡 Bu ma'lumot sizga mos javoblar berish uchun kerak.",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⏭️ O'tkazib yuborish", "skip_age")],
-      [Markup.button.callback("⬅️ Orqaga", "start_registration")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("skip_age", async (ctx) => {
-  ctx.session = { step: "interests" };
-  await ctx.editMessageText(
-    "🎯 Qiziqishlaringizni kiriting (masalan: dasturlash, sport, musiqa):\n\n" +
-      "💡 Bu sizga tegishli javoblar berish uchun kerak.",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⏭️ O'tkazib yuborish", "complete_registration")],
-      [Markup.button.callback("⬅️ Orqaga", "skip_name")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("skip_registration", async (ctx) => {
-  logger.success(`Registration skipped`, { user_id: ctx.from!.id });
-  await userService.completeRegistration(ctx.from!.id);
-  ctx.session = undefined;
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("💬 Suhbat boshlash", "start_chat")],
-    [Markup.button.callback("🤖 Model tanlash", "select_model")],
-    [
-      Markup.button.callback("📊 Statistika", "stats"),
-      Markup.button.callback("💰 Balans", "balance"),
-    ],
-    [Markup.button.callback("🎫 Promokod", "use_promocode")],
-  ]);
-
-  await ctx.editMessageText(
-    `✅ Xush kelibsiz!\n\n` +
-      `🤖 Endi AI modellari bilan suhbatlashishingiz mumkin.\n\n` +
-      `🆔 Sizning ID: ${ctx.from!.id}`,
-    keyboard
-  );
-});
-
-bot.action("complete_registration", async (ctx) => {
-  logger.success(`Registration completed`, { user_id: ctx.from!.id });
-  await userService.completeRegistration(ctx.from!.id);
-  ctx.session = undefined;
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("💬 Suhbat boshlash", "start_chat")],
-    [Markup.button.callback("🤖 Model tanlash", "select_model")],
-    [
-      Markup.button.callback("📊 Statistika", "stats"),
-      Markup.button.callback("💰 Balans", "balance"),
-    ],
-    [Markup.button.callback("🎫 Promokod", "use_promocode")],
-  ]);
-
-  await ctx.editMessageText(
-    `✅ Ro'yxatdan o'tish yakunlandi!\n\n` +
-      `🤖 Endi AI modellari bilan suhbatlashishingiz mumkin.\n\n` +
-      `🆔 Sizning ID: ${ctx.from!.id}`,
-    keyboard
-  );
-});
-
-bot.action("back_to_main", async (ctx) => {
-  ctx.session = undefined;
-  chatModeUsers.delete(ctx.from!.id);
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("💬 Suhbat boshlash", "start_chat")],
-    [Markup.button.callback("🤖 Model tanlash", "select_model")],
-    [
-      Markup.button.callback("📊 Statistika", "stats"),
-      Markup.button.callback("💰 Balans", "balance"),
-    ],
-    [Markup.button.callback("🎫 Promokod", "use_promocode")],
-    ...(ADMIN_IDS.includes(ctx.from!.id)
-      ? [[Markup.button.callback("⚙️ Admin Panel", "admin_panel")]]
-      : []),
-  ]);
-
-  await ctx.editMessageText(
-    `🎉 Assalomu alaykum, ${ctx.from!.first_name}!\n\n` +
-      `🤖 Men AI chatbot man. Sizga turli AI modellari bilan suhbatlashishda yordam beraman.\n\n` +
-      `📝 Guruhda: Reply yoki @mention qiling\n` +
-      `💬 Shaxsiy chatda: "Suhbat boshlash" tugmasini bosing\n\n` +
-      `🆔 Sizning ID: ${ctx.from!.id}`,
-    {
-      ...keyboard,
-      reply_markup: keyboard.reply_markup,
+      await ctx.reply(endChatText, {
+        ...keyboard,
+        reply_markup: {
+          ...keyboard.reply_markup,
+          remove_keyboard: true,
+        },
+        parse_mode: "HTML",
+      });
     }
-  );
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("End chat error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
 });
 
 // Promokod tugmasi
 bot.action("use_promocode", async (ctx) => {
-  ctx.session = { step: "enter_promocode" };
-  await ctx.editMessageText(
-    "🎫 Promokod kiriting:\n\n" +
-      "Promokod kodini yozing (masalan: BONUS2025)\n\n" +
-      "💡 Promokod orqali qo'shimcha tokenlar olishingiz mumkin.",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
+  try {
+    userSessions.set(ctx.from!.id, { step: "enter_promocode" });
+
+    const keyboard = KeyboardBuilder.createBackButton();
+    const text = TelegramFormatter.formatPromocodeInput();
+
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Use promocode error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+  }
 });
 
 // Ro'yxatdan o'tish xabarlari
 bot.on(message("text"), async (ctx, next) => {
-  if (ctx.session?.step) {
+  const session = userSessions.get(ctx.from.id);
+
+  if (session?.step) {
     const text = ctx.message.text;
-    logger.info(`Session step: ${ctx.session.step}`, {
+    logger.info(`Session step: ${session.step}`, {
       user_id: ctx.from.id,
       text_length: text.length,
     });
 
-    if (ctx.session.step === "name") {
+    if (session.step === "name") {
       if (text.length > 2 && text.length < 50) {
         await userService.updateUserInfo(ctx.from.id, { name: text });
-        ctx.session.step = "age";
+        userSessions.set(ctx.from.id, { step: "age" });
 
-        return ctx.reply(
-          "👤 Yoshingizni kiriting (masalan: 25):\n\n" +
-            "💡 Bu ma'lumot sizga mos javoblar berish uchun kerak.",
-          Markup.inlineKeyboard([
-            [Markup.button.callback("⏭️ O'tkazib yuborish", "skip_age")],
-            [Markup.button.callback("⬅️ Orqaga", "start_registration")],
-            [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-          ])
-        );
+        const keyboard = new KeyboardBuilder()
+          .addButton("⏭️ O'tkazib yuborish", "skip_age")
+          .addButton("⬅️ Orqaga", "start_registration")
+          .addButton("🏠 Bosh sahifa", "back_to_main")
+          .build();
+
+        const ageText = TelegramFormatter.formatRegistrationStep("age");
+        return await sendFormattedMessage(ctx, ageText, keyboard, true);
       } else {
-        return ctx.reply(
-          "❌ Iltimos, to'g'ri ism kiriting (2-50 belgi oralig'ida)"
+        return await sendFormattedMessage(
+          ctx,
+          TelegramFormatter.formatError(
+            "Iltimos, to'g'ri ism kiriting (2-50 belgi oralig'ida)"
+          ),
+          undefined,
+          true
         );
       }
     }
 
-    if (ctx.session.step === "age") {
+    if (session.step === "age") {
       const age = parseInt(text);
       if (age && age > 0 && age < 120) {
         await userService.updateUserInfo(ctx.from.id, { age });
-        ctx.session.step = "interests";
+        userSessions.set(ctx.from.id, { step: "interests" });
 
-        return ctx.reply(
-          "🎯 Qiziqishlaringizni kiriting (masalan: dasturlash, sport, musiqa):\n\n" +
-            "💡 Bu sizga tegishli javoblar berish uchun kerak.",
-          Markup.inlineKeyboard([
-            [
-              Markup.button.callback(
-                "⏭️ O'tkazib yuborish",
-                "complete_registration"
-              ),
-            ],
-            [Markup.button.callback("⬅️ Orqaga", "skip_name")],
-            [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-          ])
-        );
+        const keyboard = new KeyboardBuilder()
+          .addButton("⏭️ O'tkazib yuborish", "complete_registration")
+          .addButton("⬅️ Orqaga", "skip_name")
+          .addButton("🏠 Bosh sahifa", "back_to_main")
+          .build();
+
+        const interestsText =
+          TelegramFormatter.formatRegistrationStep("interests");
+        return await sendFormattedMessage(ctx, interestsText, keyboard, true);
       } else {
-        return ctx.reply(
-          "❌ Iltimos, to'g'ri yosh kiriting (1-120 oralig'ida)"
+        return await sendFormattedMessage(
+          ctx,
+          TelegramFormatter.formatError(
+            "Iltimos, to'g'ri yosh kiriting (1-120 oralig'ida)"
+          ),
+          undefined,
+          true
         );
       }
     }
 
-    if (ctx.session.step === "interests") {
+    if (session.step === "interests") {
       if (text.length > 2 && text.length < 200) {
         await userService.updateUserInfo(ctx.from.id, { interests: text });
         await userService.completeRegistration(ctx.from.id);
-        ctx.session = undefined;
+        userSessions.delete(ctx.from.id);
 
-        const keyboard = Markup.inlineKeyboard([
-          [Markup.button.callback("💬 Suhbat boshlash", "start_chat")],
-          [Markup.button.callback("🤖 Model tanlash", "select_model")],
-          [
-            Markup.button.callback("📊 Statistika", "stats"),
-            Markup.button.callback("💰 Balans", "balance"),
-          ],
-          [Markup.button.callback("🎫 Promokod", "use_promocode")],
-        ]);
-
-        return ctx.reply(
-          `✅ Ro'yxatdan o'tish yakunlandi!\n\n` +
-            `🤖 Endi AI modellari bilan suhbatlashishingiz mumkin.\n\n` +
-            `🆔 Sizning ID: ${ctx.from.id}`,
-          keyboard
+        const keyboard = KeyboardBuilder.createMainMenu(
+          ADMIN_IDS.includes(ctx.from.id)
         );
+        const completionText = TelegramFormatter.formatRegistrationComplete(
+          ctx.from.id
+        );
+
+        return await sendFormattedMessage(ctx, completionText, keyboard, true);
       } else {
-        return ctx.reply(
-          "❌ Iltimos, qiziqishlaringizni to'liqroq yozing (2-200 belgi)"
+        return await sendFormattedMessage(
+          ctx,
+          TelegramFormatter.formatError(
+            "Iltimos, qiziqishlaringizni to'liqroq yozing (2-200 belgi)"
+          ),
+          undefined,
+          true
         );
       }
     }
 
     // Promokod kiritish
-    if (ctx.session.step === "enter_promocode") {
+    if (session.step === "enter_promocode") {
       const code = text.toUpperCase().trim();
 
       try {
         const result = await promocodeService.usePromocode(code, ctx.from.id);
-        ctx.session = undefined;
+        userSessions.delete(ctx.from.id);
 
         if (result.success) {
-          return ctx.reply(
-            `✅ ${result.message}\n\n` +
-              `🎁 Qo'shildi:\n` +
-              `🔥 Kunlik: +${result.tokens!.daily} token\n` +
-              `💎 Umumiy: +${result.tokens!.total} token`
+          const successText = TelegramFormatter.formatPromocodeSuccess(
+            result.message,
+            result.tokens!.daily,
+            result.tokens!.total
           );
+          return await sendFormattedMessage(ctx, successText, undefined, true);
         } else {
-          return ctx.reply(`❌ ${result.message}`);
+          return await sendFormattedMessage(
+            ctx,
+            TelegramFormatter.formatError(result.message),
+            undefined,
+            true
+          );
         }
       } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : "Unknown error";
         logger.error(`Promocode error`, {
-          error: error.message,
+          error: errorMessage,
           user_id: ctx.from.id,
           code,
         });
-        ctx.session = undefined;
-        return ctx.reply("❌ Promokod ishlatishda xatolik yuz berdi");
-      }
-    }
-
-    // Broadcast xabar yuborish (faqat adminlar uchun)
-    if (
-      ctx.session.step === "broadcast_message" &&
-      ADMIN_IDS.includes(ctx.from.id)
-    ) {
-      const message = text;
-      const type = ctx.session.data?.type;
-      const count = ctx.session.data?.count;
-
-      logger.broadcast(`Broadcasting message`, {
-        type,
-        count,
-        admin_id: ctx.from.id,
-        message_length: message.length,
-      });
-
-      try {
-        let successCount = 0;
-
-        if (type === "all") {
-          successCount = await broadcastService.broadcastToAll(bot, message);
-        } else if (type === "active") {
-          successCount = await broadcastService.broadcastToActive(bot, message);
-        } else if (type === "count" && count) {
-          successCount = await broadcastService.broadcastToCount(
-            bot,
-            message,
-            count
-          );
-        } else if (type === "groups") {
-          successCount = await broadcastService.broadcastToGroups(bot, message);
-        }
-
-        ctx.session = undefined;
-        logger.success(`Broadcast completed`, { successCount, type, count });
-        return ctx.reply(
-          `✅ Broadcast yuborildi!\n\n📊 Muvaffaqiyatli: ${successCount} ta`
+        userSessions.delete(ctx.from.id);
+        return await sendFormattedMessage(
+          ctx,
+          TelegramFormatter.formatError(
+            "Promokod ishlatishda xatolik yuz berdi"
+          ),
+          undefined,
+          true
         );
-      } catch (error) {
-        logger.error(`Broadcast error`, { error: error.message });
-        ctx.session = undefined;
-        return ctx.reply(`❌ Broadcast yuborishda xatolik: ${error}`);
-      }
-    }
-
-    // Broadcast soni kiritish (faqat adminlar uchun)
-    if (
-      ctx.session.step === "broadcast_count" &&
-      ADMIN_IDS.includes(ctx.from.id)
-    ) {
-      const count = parseInt(text);
-      const totalUsers = await adminService.getTotalUsers();
-
-      if (!count || count <= 0) {
-        return ctx.reply("❌ Iltimos, to'g'ri son kiriting (0 dan katta)");
-      }
-
-      if (count > totalUsers) {
-        return ctx.reply(
-          `❌ Kiritilgan son (${count}) jami foydalanuvchilar sonidan (${totalUsers}) katta!\n\nIltimos, ${totalUsers} dan kichik son kiriting.`
-        );
-      }
-
-      ctx.session = {
-        step: "broadcast_message",
-        data: { type: "count", count },
-      };
-
-      return ctx.reply(
-        `📝 ${count} ta foydalanuvchiga yuborish uchun xabaringizni kiriting:`
-      );
-    }
-
-    // Promokod yaratish (faqat adminlar uchun)
-    if (
-      ctx.session.step === "create_promo_code" &&
-      ADMIN_IDS.includes(ctx.from.id)
-    ) {
-      const code = text.toUpperCase().trim();
-
-      if (code.length < 3 || code.length > 20) {
-        return ctx.reply("❌ Promokod 3-20 belgi oralig'ida bo'lishi kerak");
-      }
-
-      if (!/^[A-Z0-9]+$/.test(code)) {
-        return ctx.reply(
-          "❌ Promokod faqat harflar va raqamlardan iborat bo'lishi kerak"
-        );
-      }
-
-      ctx.session = {
-        step: "create_promo_tokens",
-        data: { code },
-      };
-
-      return ctx.reply(
-        `📝 "${code}" promokodi uchun token miqdorini kiriting:\n\nFormat: <kunlik_token> <umumiy_token> <ishlatish_soni>\nMisol: 1000 5000 50`
-      );
-    }
-
-    // Promokod token ma'lumotlari (faqat adminlar uchun)
-    if (
-      ctx.session.step === "create_promo_tokens" &&
-      ADMIN_IDS.includes(ctx.from.id)
-    ) {
-      const args = text.split(" ");
-
-      if (args.length !== 3) {
-        return ctx.reply(
-          "❌ Format: <kunlik_token> <umumiy_token> <ishlatish_soni>\nMisol: 1000 5000 50"
-        );
-      }
-
-      const [dailyTokens, totalTokens, maxUsage] = args.map((arg) =>
-        parseInt(arg)
-      );
-
-      if (
-        isNaN(dailyTokens) ||
-        isNaN(totalTokens) ||
-        isNaN(maxUsage) ||
-        dailyTokens < 0 ||
-        totalTokens < 0 ||
-        maxUsage <= 0
-      ) {
-        return ctx.reply(
-          "❌ Kunlik va umumiy tokenlar 0 yoki musbat, ishlatish soni musbat bo'lishi kerak"
-        );
-      }
-
-      const code = ctx.session.data?.code;
-
-      try {
-        await promocodeService.createPromocode(
-          code,
-          dailyTokens,
-          totalTokens,
-          maxUsage,
-          ctx.from.id
-        );
-        ctx.session = undefined;
-
-        return ctx.reply(
-          `✅ Promokod yaratildi!\n\n` +
-            `🎫 Kod: ${code}\n` +
-            `🔥 Kunlik tokenlar: ${dailyTokens}\n` +
-            `💎 Umumiy tokenlar: ${totalTokens}\n` +
-            `👥 Maksimal ishlatish: ${maxUsage}`
-        );
-      } catch (error) {
-        ctx.session = undefined;
-        return ctx.reply(`❌ Xatolik: ${error.message}`);
       }
     }
   }
@@ -548,734 +736,233 @@ bot.on(message("text"), async (ctx, next) => {
   return next();
 });
 
-// /stats buyrug'i
+// Commands
 bot.command("stats", async (ctx) => {
-  logger.info(`Stats command`, { user_id: ctx.from!.id });
-  const stats = await statsService.getUserStats(ctx.from!.id);
-  await ctx.reply(
-    `📊 Sizning statistikangiz:\n\n` +
-      `🆔 User ID: ${ctx.from!.id}\n` +
-      `📅 Bugungi so'rovlar: ${stats.daily_requests}\n` +
-      `🔥 Bugungi tokenlar: ${stats.daily_tokens}\n` +
-      `📈 Jami so'rovlar: ${stats.total_requests}\n` +
-      `💎 Jami tokenlar: ${stats.total_tokens}\n` +
-      `📆 Ro'yxatdan o'tgan: ${new Date(stats.created_at).toLocaleDateString(
-        "uz-UZ"
-      )}`
-  );
+  try {
+    logger.info(`Stats command`, { user_id: ctx.from!.id });
+    const stats = await statsService.getUserStats(ctx.from!.id);
+    const statsText = TelegramFormatter.formatStats({
+      user_id: ctx.from!.id,
+      daily_requests: stats.daily_requests,
+      daily_tokens: stats.daily_tokens,
+      total_requests: stats.total_requests,
+      total_tokens: stats.total_tokens,
+      created_at: stats.created_at,
+    });
+
+    await sendFormattedMessage(ctx, statsText, undefined, true);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Stats command error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Statistikani olishda xatolik yuz berdi."),
+      undefined,
+      true
+    );
+  }
 });
 
-// /balance buyrug'i
 bot.command("balance", async (ctx) => {
-  logger.info(`Balance command`, { user_id: ctx.from!.id });
-  const user = await userService.getUser(ctx.from!.id);
-  if (!user) return;
+  try {
+    logger.info(`Balance command`, { user_id: ctx.from!.id });
+    const user = await userService.getUser(ctx.from!.id);
+    if (!user) {
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError("Foydalanuvchi ma'lumotlari topilmadi."),
+        undefined,
+        true
+      );
+    }
 
-  const remainingDaily = user.daily_tokens - user.daily_used;
-  const remainingTotal = user.total_tokens - user.total_used;
-
-  await ctx.reply(
-    `💰 Sizning balansingiz:\n\n` +
-      `🆔 User ID: ${ctx.from!.id}\n` +
-      `🔥 Qolgan kunlik: ${remainingDaily} token\n` +
-      `💎 Qolgan umumiy: ${remainingTotal} token`
-  );
+    const balanceText = TelegramFormatter.formatBalance(user);
+    await sendFormattedMessage(ctx, balanceText, undefined, true);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Balance command error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Balansni olishda xatolik yuz berdi."),
+      undefined,
+      true
+    );
+  }
 });
 
 // /model buyrug'i
 bot.command("model", async (ctx) => {
-  logger.info(`Model command`, { user_id: ctx.from!.id });
-  const models = await modelService.getActiveModels();
-  const user = await userService.getUser(ctx.from!.id);
+  try {
+    logger.info(`Model command`, { user_id: ctx.from!.id });
+    const models = await modelService.getActiveModels();
+    const user = await userService.getUser(ctx.from!.id);
 
-  // Modellarni 10 tadan ko'rsatish
-  const keyboard = Markup.inlineKeyboard([
-    ...models
-      .slice(0, 10)
-      .map((model, index) => [
-        Markup.button.callback(
-          `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
-          `model_${index}`
-        ),
-      ]),
-    ...(models.length > 10
-      ? [[Markup.button.callback("➡️ Keyingi", "models_next_0")]]
-      : []),
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
+    if (models.length === 0) {
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError("Hozirda faol modellar mavjud emas."),
+        undefined,
+        true
+      );
+    }
 
-  await ctx.reply("🤖 AI modelni tanlang:", keyboard);
+    // Modellarni 10 tadan ko'rsatish
+    const keyboard = new KeyboardBuilder();
+
+    models.slice(0, 10).forEach((model, index) => {
+      keyboard.addButton(
+        `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
+        `model_${index}`
+      );
+    });
+
+    if (models.length > 10) {
+      keyboard.addButton("➡️ Keyingi", "models_next_0");
+    }
+
+    keyboard.addButton("🏠 Bosh sahifa", "back_to_main");
+
+    await sendFormattedMessage(
+      ctx,
+      "🤖 AI modelni tanlang:",
+      keyboard.build(),
+      true
+    );
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Model command error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Modellarni yuklashda xatolik yuz berdi."),
+      undefined,
+      true
+    );
+  }
 });
 
-// /admin buyrug'i (faqat adminlar uchun)
+bot.command("help", async (ctx) => {
+  try {
+    logger.info(`Help command`, { user_id: ctx.from!.id });
+    const user = await userService.getUser(ctx.from!.id);
+    const isAdmin = ADMIN_IDS.includes(ctx.from!.id);
+
+    const helpText = TelegramFormatter.formatHelp(user, isAdmin);
+    await sendFormattedMessage(ctx, helpText, undefined, true);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Help command error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError(
+        "Yordam ma'lumotlarini olishda xatolik yuz berdi."
+      ),
+      undefined,
+      true
+    );
+  }
+});
+
+// FIXED: Promocode command handler
+bot.command("promocode", async (ctx) => {
+  try {
+    const args = ctx.message.text.split(" ");
+    if (args.length !== 2) {
+      const formatText = TelegramFormatter.formatPromocodeUsage();
+      return await sendFormattedMessage(ctx, formatText, undefined, true);
+    }
+
+    const code = args[1].toUpperCase().trim();
+    const result = await promocodeService.usePromocode(code, ctx.from!.id);
+
+    if (result.success) {
+      logger.success(`Promocode used successfully`, {
+        user_id: ctx.from!.id,
+        code,
+      });
+      const successText = TelegramFormatter.formatPromocodeSuccess(
+        result.message,
+        result.tokens!.daily,
+        result.tokens!.total
+      );
+      return await sendFormattedMessage(ctx, successText, undefined, true);
+    } else {
+      logger.warning(`Promocode usage failed`, {
+        user_id: ctx.from!.id,
+        code,
+        reason: result.message,
+      });
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError(result.message),
+        undefined,
+        true
+      );
+    }
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error(`Promocode command error`, {
+      error: errorMessage,
+      user_id: ctx.from!.id,
+    });
+    return await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Promokod ishlatishda xatolik yuz berdi"),
+      undefined,
+      true
+    );
+  }
+});
+
+// Admin commands
 bot.command("admin", async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from!.id)) {
     logger.warning(`Unauthorized admin access attempt`, {
       user_id: ctx.from!.id,
     });
-    return ctx.reply("❌ Sizda admin huquqi yo'q!");
-  }
-
-  logger.admin(`Admin panel accessed`, { admin_id: ctx.from!.id });
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("📊 Statistika", "admin_stats")],
-    [Markup.button.callback("💰 Token qo'shish", "admin_add_tokens")],
-    [Markup.button.callback("💸 Token ayirish", "admin_remove_tokens")],
-    [Markup.button.callback("🎫 Promokodlar", "admin_promocodes")],
-    [Markup.button.callback("📢 Broadcast", "admin_broadcast")],
-    [Markup.button.callback("🤖 Modellar", "admin_models")],
-    [Markup.button.callback("📋 Buyruqlar", "admin_commands")],
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.reply("⚙️ Admin Panel:", keyboard);
-});
-
-// /help buyrug'i
-bot.command("help", async (ctx) => {
-  logger.info(`Help command`, { user_id: ctx.from!.id });
-  const user = await userService.getUser(ctx.from!.id);
-
-  let helpText =
-    `🤖 AI Chatbot Yordam\n\n` +
-    `Asosiy buyruqlar:\n` +
-    `/start - Botni qayta ishga tushirish\n` +
-    `/model - AI model tanlash\n` +
-    `/stats - Statistikangizni ko'rish\n` +
-    `/balance - Qolgan tokenlarni tekshirish\n` +
-    `/promocode <kod> - Promokod ishlatish\n` +
-    `/help - Bu yordam xabari\n\n`;
-
-  if (ADMIN_IDS.includes(ctx.from!.id)) {
-    helpText +=
-      `Admin buyruqlari:\n` +
-      `/admin - Admin panel\n` +
-      `/add_tokens <user_id> <daily> <total> - Token qo'shish\n` +
-      `/remove_tokens <user_id> <daily> <total> - Token ayirish\n` +
-      `/add_promo <code> <daily> <total> <usage> - Promokod yaratish\n` +
-      `/broadcast <xabar> - Xabar yuborish\n\n`;
-  }
-
-  helpText +=
-    `Qanday foydalanish:\n` +
-    `• Shaxsiy chatda: "Suhbat boshlash" tugmasini bosing\n` +
-    `• Guruhda: Botga reply qiling yoki @mention qiling\n\n` +
-    `Sizning ma'lumotlaringiz:\n` +
-    `🆔 ID: ${ctx.from!.id}\n` +
-    `🔥 Kunlik limit: ${user?.daily_tokens || 0} token\n` +
-    `💎 Umumiy limit: ${user?.total_tokens || 0} token\n\n` +
-    `Token tugasa:\n` +
-    `Admin bilan bog'laning: @abdulahadov_abdumutolib`;
-
-  await ctx.reply(helpText);
-});
-
-// /promocode buyrug'i
-bot.command("promocode", async (ctx) => {
-  const args = ctx.message.text.split(" ");
-  if (args.length !== 2) {
-    return ctx.reply(
-      "❌ Format: /promocode <kod>\n\n" + "Misol: /promocode BONUS2025"
+    return await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Sizda admin huquqi yo'q!"),
+      undefined,
+      true
     );
   }
 
-  const code = args[1].toUpperCase().trim();
-
   try {
-    const result = await promocodeService.usePromocode(code, ctx.from!.id);
-
-    if (result.success) {
-      return ctx.reply(
-        `✅ ${result.message}\n\n` +
-          `🎁 Qo'shildi:\n` +
-          `🔥 Kunlik: +${result.tokens!.daily} token\n` +
-          `💎 Umumiy: +${result.tokens!.total} token`
-      );
-    } else {
-      return ctx.reply(`❌ ${result.message}`);
-    }
+    logger.admin(`Admin panel accessed`, { admin_id: ctx.from!.id });
+    const keyboard = KeyboardBuilder.createAdminPanel();
+    await sendFormattedMessage(ctx, "⚙️ <b>Admin Panel:</b>", keyboard, true);
   } catch (error) {
-    logger.error(`Promocode error`, {
-      error: error.message,
-      user_id: ctx.from!.id,
-      code,
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin command error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
     });
-    return ctx.reply("❌ Promokod ishlatishda xatolik yuz berdi");
-  }
-});
-
-// /broadcast buyrug'i (faqat adminlar uchun)
-bot.command("broadcast", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) {
-    logger.warning(`Unauthorized broadcast attempt`, { user_id: ctx.from!.id });
-    return ctx.reply("❌ Sizda admin huquqi yo'q!");
-  }
-
-  const args = ctx.message.text.split(" ");
-  if (args.length < 2) {
-    return ctx.reply(
-      "❌ Format: /broadcast <xabar>\n\n" +
-        "Misol: /broadcast Salom hammaga!\n\n" +
-        "Rasm/video bilan: rasm yuborib caption sifatida /broadcast <xabar> yozing"
-    );
-  }
-
-  const message = args.slice(1).join(" ");
-
-  try {
-    logger.broadcast(`Broadcasting via command`, {
-      admin_id: ctx.from!.id,
-      message_length: message.length,
-    });
-    const successCount = await broadcastService.broadcastToAll(bot, message);
-    logger.success(`Broadcast completed via command`, { successCount });
-    await ctx.reply(
-      `✅ Broadcast yuborildi!\n\n📊 Muvaffaqiyatli: ${successCount} ta foydalanuvchi`
-    );
-  } catch (error) {
-    logger.error(`Broadcast command error`, { error: error.message });
-    await ctx.reply(`❌ Broadcast yuborishda xatolik: ${error}`);
-  }
-});
-
-// /add_promo buyrug'i (faqat adminlar uchun)
-bot.command("add_promo", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) {
-    return ctx.reply("❌ Sizda admin huquqi yo'q!");
-  }
-
-  const args = ctx.message.text.split(" ");
-  if (args.length !== 5) {
-    return ctx.reply(
-      "❌ Format: /add_promo <code> <daily_tokens> <total_tokens> <max_usage>\n\n" +
-        "Misol: /add_promo BONUS2025 1000 5000 50\n" +
-        "Misol: /add_promo GIFT100 0 10000 100 (faqat umumiy token)"
-    );
-  }
-
-  const [, code, dailyTokens, totalTokens, maxUsage] = args;
-  const daily = parseInt(dailyTokens);
-  const total = parseInt(totalTokens);
-  const usage = parseInt(maxUsage);
-
-  if (
-    isNaN(daily) ||
-    isNaN(total) ||
-    isNaN(usage) ||
-    daily < 0 ||
-    total < 0 ||
-    usage <= 0
-  ) {
-    return ctx.reply(
-      "❌ Kunlik va umumiy tokenlar 0 yoki musbat, ishlatish soni musbat bo'lishi kerak"
-    );
-  }
-
-  try {
-    await promocodeService.createPromocode(
-      code.toUpperCase(),
-      daily,
-      total,
-      usage,
-      ctx.from!.id
-    );
-
-    return ctx.reply(
-      `✅ Promokod yaratildi!\n\n` +
-        `🎫 Kod: ${code.toUpperCase()}\n` +
-        `🔥 Kunlik tokenlar: ${daily}\n` +
-        `💎 Umumiy tokenlar: ${total}\n` +
-        `👥 Maksimal ishlatish: ${usage}`
-    );
-  } catch (error) {
-    return ctx.reply(`❌ Xatolik: ${error.message}`);
-  }
-});
-
-// Callback query handlers
-bot.action("select_model", async (ctx) => {
-  const models = await modelService.getActiveModels();
-  const user = await userService.getUser(ctx.from!.id);
-
-  // Modellarni 10 tadan ko'rsatish
-  const keyboard = Markup.inlineKeyboard([
-    ...models
-      .slice(0, 10)
-      .map((model, index) => [
-        Markup.button.callback(
-          `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
-          `model_${index}`
-        ),
-      ]),
-    ...(models.length > 10
-      ? [[Markup.button.callback("➡️ Keyingi", "models_next_0")]]
-      : []),
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText("🤖 AI modelni tanlang:", keyboard);
-});
-
-// Model tanlash (index bo'yicha)
-bot.action(/model_(\d+)/, async (ctx) => {
-  const modelIndex = parseInt(ctx.match[1]);
-  const models = await modelService.getActiveModels();
-  const model = models[modelIndex];
-
-  if (!model) {
-    return ctx.editMessageText("❌ Model topilmadi!");
-  }
-
-  await userService.updateSelectedModel(ctx.from!.id, model.id);
-  logger.success(`Model selected`, {
-    user_id: ctx.from!.id,
-    model: model.name,
-  });
-
-  await ctx.editMessageText(
-    `✅ Model tanlandi: ${model.name}\n\n` +
-      `⚠️ Eslatma: Barcha AI modellari O'zbek tilini bir xil darajada bilmaydi. ` +
-      `Agar javob ingliz tilida kelsa, "O'zbek tilida javob ber" deb so'rang.`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-// Modellar sahifalash
-bot.action(/models_next_(\d+)/, async (ctx) => {
-  const page = parseInt(ctx.match[1]);
-  const models = await modelService.getActiveModels();
-  const user = await userService.getUser(ctx.from!.id);
-
-  const startIndex = (page + 1) * 10;
-  const endIndex = Math.min(startIndex + 10, models.length);
-  const pageModels = models.slice(startIndex, endIndex);
-
-  const keyboard = Markup.inlineKeyboard([
-    ...(page >= 0
-      ? [[Markup.button.callback("⬅️ Oldingi", `models_prev_${page + 1}`)]]
-      : []),
-    ...pageModels.map((model, index) => [
-      Markup.button.callback(
-        `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
-        `model_${startIndex + index}`
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError(
+        "Admin panelni ochishda xatolik yuz berdi."
       ),
-    ]),
-    ...(endIndex < models.length
-      ? [[Markup.button.callback("➡️ Keyingi", `models_next_${page + 1}`)]]
-      : []),
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText("🤖 AI modelni tanlang:", keyboard);
-});
-
-bot.action(/models_prev_(\d+)/, async (ctx) => {
-  const page = parseInt(ctx.match[1]) - 1;
-  const models = await modelService.getActiveModels();
-  const user = await userService.getUser(ctx.from!.id);
-
-  const startIndex = page * 10;
-  const endIndex = Math.min(startIndex + 10, models.length);
-  const pageModels = models.slice(startIndex, endIndex);
-
-  const keyboard = Markup.inlineKeyboard([
-    ...(page > 0
-      ? [[Markup.button.callback("⬅️ Oldingi", `models_prev_${page}`)]]
-      : []),
-    ...pageModels.map((model, index) => [
-      Markup.button.callback(
-        `${model.id === user?.selected_model ? "✅" : "🤖"} ${model.name}`,
-        `model_${startIndex + index}`
-      ),
-    ]),
-    ...(endIndex < models.length
-      ? [[Markup.button.callback("➡️ Keyingi", `models_next_${page + 1}`)]]
-      : []),
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText("🤖 AI modelni tanlang:", keyboard);
-});
-
-bot.action("stats", async (ctx) => {
-  const stats = await statsService.getUserStats(ctx.from!.id);
-  await ctx.editMessageText(
-    `📊 Sizning statistikangiz:\n\n` +
-      `🆔 User ID: ${ctx.from!.id}\n` +
-      `📅 Bugungi so'rovlar: ${stats.daily_requests}\n` +
-      `🔥 Bugungi tokenlar: ${stats.daily_tokens}\n` +
-      `📈 Jami so'rovlar: ${stats.total_requests}\n` +
-      `💎 Jami tokenlar: ${stats.total_tokens}\n` +
-      `📆 Ro'yxatdan o'tgan: ${new Date(stats.created_at).toLocaleDateString(
-        "uz-UZ"
-      )}`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("balance", async (ctx) => {
-  const user = await userService.getUser(ctx.from!.id);
-  if (!user) return;
-
-  const remainingDaily = user.daily_tokens - user.daily_used;
-  const remainingTotal = user.total_tokens - user.total_used;
-
-  await ctx.editMessageText(
-    `💰 Sizning balansingiz:\n\n` +
-      `🆔 User ID: ${ctx.from!.id}\n` +
-      `🔥 Qolgan kunlik: ${remainingDaily} token\n` +
-      `💎 Qolgan umumiy: ${remainingTotal} token`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-// Admin callback handlers (faqat adminlar uchun)
-bot.action("admin_panel", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("📊 Statistika", "admin_stats")],
-    [Markup.button.callback("💰 Token qo'shish", "admin_add_tokens")],
-    [Markup.button.callback("💸 Token ayirish", "admin_remove_tokens")],
-    [Markup.button.callback("🎫 Promokodlar", "admin_promocodes")],
-    [Markup.button.callback("📢 Broadcast", "admin_broadcast")],
-    [Markup.button.callback("🤖 Modellar", "admin_models")],
-    [Markup.button.callback("📋 Buyruqlar", "admin_commands")],
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText("⚙️ Admin Panel:", keyboard);
-});
-
-bot.action("admin_stats", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  logger.admin(`Admin stats viewed`, { admin_id: ctx.from!.id });
-  const stats = await adminService.getSystemStats();
-  await ctx.editMessageText(
-    `📊 Tizim statistikasi:\n\n` +
-      `👥 Jami foydalanuvchilar: ${stats.total_users}\n` +
-      `📅 Bugungi faol: ${stats.daily_active}\n` +
-      `💬 Bugungi so'rovlar: ${stats.daily_requests}\n` +
-      `🔥 Bugungi tokenlar: ${stats.daily_tokens}\n` +
-      `📈 Jami so'rovlar: ${stats.total_requests}\n` +
-      `💎 Jami tokenlar: ${stats.total_tokens}`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("admin_add_tokens", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  await ctx.editMessageText(
-    "💰 Token qo'shish:\n\n" +
-      "Format: /add_tokens <user_id> <daily_tokens> <total_tokens>\n\n" +
-      "Misol: /add_tokens 123456789 1000 5000\n\n" +
-      "💡 Foydalanuvchi o'z ID sini /balance buyrug'i orqali ko'rishi mumkin.",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("admin_remove_tokens", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  await ctx.editMessageText(
-    "💸 Token ayirish:\n\n" +
-      "Format: /remove_tokens <user_id> <daily_tokens> <total_tokens>\n\n" +
-      "Misol: /remove_tokens 123456789 500 2000\n\n" +
-      "⚠️ Agar foydalanuvchida yetarli token bo'lmasa, xatolik ko'rsatiladi.",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("admin_promocodes", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("➕ Promokod yaratish", "create_promocode")],
-    [Markup.button.callback("📋 Promokodlar ro'yxati", "list_promocodes")],
-    [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText(
-    "🎫 Promokodlar boshqaruvi:\n\n" +
-      "Yoki buyruq orqali: /add_promo <code> <daily> <total> <usage>",
-    keyboard
-  );
-});
-
-bot.action("create_promocode", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  ctx.session = { step: "create_promo_code" };
-
-  await ctx.editMessageText(
-    "🎫 Yangi promokod yaratish:\n\n" +
-      "Promokod nomini kiriting (3-20 belgi, faqat harflar va raqamlar):\n\n" +
-      "Misol: BONUS2025, NEWUSER, GIFT100"
-  );
-});
-
-bot.action("list_promocodes", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const promocodes = await promocodeService.getAllPromocodes();
-
-  if (promocodes.length === 0) {
-    return ctx.editMessageText(
-      "📋 Promokodlar ro'yxati bo'sh",
-      Markup.inlineKeyboard([
-        [Markup.button.callback("⬅️ Orqaga", "admin_promocodes")],
-        [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-      ])
+      undefined,
+      true
     );
-  }
-
-  let text = "📋 Promokodlar ro'yxati:\n\n";
-
-  promocodes.slice(0, 10).forEach((promo, index) => {
-    const status = promo.is_active ? "✅" : "❌";
-    const usage = `${promo.current_usage}/${promo.max_usage}`;
-    text += `${index + 1}. ${status} ${promo.code}\n`;
-    text += `   🔥 ${promo.daily_tokens} | 💎 ${promo.total_tokens} | 👥 ${usage}\n\n`;
-  });
-
-  if (promocodes.length > 10) {
-    text += `... va yana ${promocodes.length - 10} ta`;
-  }
-
-  await ctx.editMessageText(
-    text,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ Orqaga", "admin_promocodes")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ])
-  );
-});
-
-bot.action("admin_broadcast", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("📢 Hammaga", "broadcast_all")],
-    [Markup.button.callback("👥 Faollarga", "broadcast_active")],
-    [Markup.button.callback("🔢 Songa ko'ra", "broadcast_count")],
-    [Markup.button.callback("👥 Guruhlarga", "broadcast_groups")],
-    [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText(
-    "📢 Broadcast turi:\n\n" +
-      "Yoki buyruq orqali: /broadcast <xabar>\n" +
-      "Rasm/video bilan: rasm yuborib caption sifatida /broadcast <xabar> yozing",
-    keyboard
-  );
-});
-
-bot.action("broadcast_all", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const totalUsers = await adminService.getTotalUsers();
-  ctx.session = { step: "broadcast_message", data: { type: "all" } };
-
-  await ctx.editMessageText(
-    `📝 Barcha foydalanuvchilarga (${totalUsers} ta) yuborish uchun xabaringizni kiriting:`
-  );
-});
-
-bot.action("broadcast_active", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const activeUsers = await adminService.getActiveUsers();
-  ctx.session = { step: "broadcast_message", data: { type: "active" } };
-
-  await ctx.editMessageText(
-    `📝 Faol foydalanuvchilarga (${activeUsers} ta) yuborish uchun xabaringizni kiriting:`
-  );
-});
-
-bot.action("broadcast_count", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const totalUsers = await adminService.getTotalUsers();
-  ctx.session = { step: "broadcast_count" };
-
-  await ctx.editMessageText(
-    `🔢 Nechta foydalanuvchiga yubormoqchisiz?\n\nJami foydalanuvchilar: ${totalUsers}\n\nSonni kiriting:`
-  );
-});
-
-bot.action("broadcast_groups", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  ctx.session = { step: "broadcast_message", data: { type: "groups" } };
-
-  await ctx.editMessageText(
-    `📝 Guruhlarga yuborish uchun xabaringizni kiriting:\n\n⚠️ Guruhlar ro'yxati hozircha bo'sh`
-  );
-});
-
-bot.action("admin_models", async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  logger.admin(`Admin models viewed`, { admin_id: ctx.from!.id });
-  const models = await modelService.getAllModels();
-  const keyboard = Markup.inlineKeyboard([
-    ...models
-      .slice(0, 15)
-      .map((model, index) => [
-        Markup.button.callback(
-          `${model.is_active ? "✅" : "❌"} ${model.name.substring(0, 30)}`,
-          `admin_model_${index}`
-        ),
-      ]),
-    ...(models.length > 15
-      ? [[Markup.button.callback("➡️ Ko'proq", "admin_models_next_0")]]
-      : []),
-    [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText("🤖 Modellar boshqaruvi:", keyboard);
-});
-
-// Admin models pagination (next page)
-bot.action(/admin_models_next_(\d+)/, async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const page = parseInt(ctx.match[1]) + 1;
-  const models = await modelService.getAllModels();
-  const startIndex = page * 15;
-  const endIndex = Math.min(startIndex + 15, models.length);
-  const pageModels = models.slice(startIndex, endIndex);
-
-  const keyboard = Markup.inlineKeyboard([
-    ...(page > 0
-      ? [
-          [
-            Markup.button.callback(
-              "⬅️ Oldingi",
-              `admin_models_prev_${page - 1}`
-            ),
-          ],
-        ]
-      : []),
-    ...pageModels.map((model, index) => [
-      Markup.button.callback(
-        `${model.is_active ? "✅" : "❌"} ${model.name.substring(0, 30)}`,
-        `admin_model_${startIndex + index}`
-      ),
-    ]),
-    ...(endIndex < models.length
-      ? [[Markup.button.callback("➡️ Ko'proq", `admin_models_next_${page}`)]]
-      : []),
-    [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText("🤖 Modellar boshqaruvi:", keyboard);
-});
-
-// Admin models pagination (previous page)
-bot.action(/admin_models_prev_(\d+)/, async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const page = parseInt(ctx.match[1]);
-  const models = await modelService.getAllModels();
-  const startIndex = page * 15;
-  const endIndex = Math.min(startIndex + 15, models.length);
-  const pageModels = models.slice(startIndex, endIndex);
-
-  const keyboard = Markup.inlineKeyboard([
-    ...(page > 0
-      ? [
-          [
-            Markup.button.callback(
-              "⬅️ Oldingi",
-              `admin_models_prev_${page - 1}`
-            ),
-          ],
-        ]
-      : []),
-    ...pageModels.map((model, index) => [
-      Markup.button.callback(
-        `${model.is_active ? "✅" : "❌"} ${model.name.substring(0, 30)}`,
-        `admin_model_${startIndex + index}`
-      ),
-    ]),
-    ...(endIndex < models.length
-      ? [[Markup.button.callback("➡️ Ko'proq", `admin_models_next_${page}`)]]
-      : []),
-    [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-    [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-  ]);
-
-  await ctx.editMessageText("🤖 Modellar boshqaruvi:", keyboard);
-});
-
-// Admin model toggle
-bot.action(/admin_model_(\d+)/, async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
-
-  const modelIndex = parseInt(ctx.match[1]);
-  const models = await modelService.getAllModels();
-  const model = models[modelIndex];
-
-  if (!model) {
-    return ctx.answerCbQuery("❌ Model topilmadi!");
-  }
-
-  try {
-    await modelService.updateModel(model.id, { is_active: !model.is_active });
-    logger.admin(`Model toggled`, {
-      admin_id: ctx.from!.id,
-      model: model.name,
-      new_status: !model.is_active,
-    });
-
-    await ctx.answerCbQuery(
-      `✅ ${model.name} ${!model.is_active ? "yoqildi" : "o'chirildi"}`
-    );
-
-    // Refresh the models list
-    const updatedModels = await modelService.getAllModels();
-    const keyboard = Markup.inlineKeyboard([
-      ...updatedModels
-        .slice(0, 15)
-        .map((m, index) => [
-          Markup.button.callback(
-            `${m.is_active ? "✅" : "❌"} ${m.name.substring(0, 30)}`,
-            `admin_model_${index}`
-          ),
-        ]),
-      ...(updatedModels.length > 15
-        ? [[Markup.button.callback("➡️ Ko'proq", "admin_models_next_0")]]
-        : []),
-      [Markup.button.callback("⬅️ Orqaga", "admin_panel")],
-      [Markup.button.callback("🏠 Bosh sahifa", "back_to_main")],
-    ]);
-
-    await ctx.editMessageText("🤖 Modellar boshqaruvi:", keyboard);
-  } catch (error) {
-    logger.error(`Model toggle error`, { error: error.message });
-    await ctx.answerCbQuery("❌ Xatolik yuz berdi");
   }
 });
 
@@ -1284,14 +971,17 @@ bot.on(message("text"), async (ctx) => {
   const text = ctx.message.text;
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
 
-  // Admin buyruqlarini tekshirish (faqat adminlar uchun)
-  if (text.startsWith("/add_tokens") && ADMIN_IDS.includes(ctx.from.id)) {
+  // Admin buyruqlarini tekshirish - FIXED ALL COMMAND VARIATIONS
+  if (
+    (text.startsWith("/add_tokens") ||
+      text.startsWith("/addtokens") ||
+      text.startsWith("/add_token")) &&
+    ADMIN_IDS.includes(ctx.from.id)
+  ) {
     const args = text.split(" ");
     if (args.length !== 4) {
-      return ctx.reply(
-        "❌ Format: /add_tokens <user_id> <daily_tokens> <total_tokens>\n\n" +
-          "Misol: /add_tokens 123456789 1000 5000"
-      );
+      const formatText = TelegramFormatter.formatAdminTokenUsage("add");
+      return await sendFormattedMessage(ctx, formatText, undefined, true);
     }
 
     const [, userId, dailyTokens, totalTokens] = args;
@@ -1308,23 +998,38 @@ bot.on(message("text"), async (ctx) => {
         daily: dailyTokens,
         total: totalTokens,
       });
-      return ctx.reply(
-        `✅ Foydalanuvchi ${userId} ga tokenlar qo'shildi!\n\n📊 Qo'shildi:\n🔥 Kunlik: +${dailyTokens}\n💎 Umumiy: +${totalTokens}`
+
+      const successText = TelegramFormatter.formatTokenOperation(
+        userId,
+        parseInt(dailyTokens),
+        parseInt(totalTokens),
+        "added"
       );
+      return await sendFormattedMessage(ctx, successText, undefined, true);
     } catch (error) {
-      logger.error(`Token add error`, { error: error.message });
-      return ctx.reply(`❌ Xatolik: ${error}`);
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error(`Token add error`, { error: errorMessage });
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError(`Xatolik: ${errorMessage}`),
+        undefined,
+        true
+      );
     }
   }
 
-  // Remove tokens buyrug'i (faqat adminlar uchun)
-  if (text.startsWith("/remove_tokens") && ADMIN_IDS.includes(ctx.from.id)) {
+  // Remove tokens command - FIXED ALL COMMAND VARIATIONS
+  if (
+    (text.startsWith("/remove_tokens") ||
+      text.startsWith("/removetokens") ||
+      text.startsWith("/remove_token")) &&
+    ADMIN_IDS.includes(ctx.from.id)
+  ) {
     const args = text.split(" ");
     if (args.length !== 4) {
-      return ctx.reply(
-        "❌ Format: /remove_tokens <user_id> <daily_tokens> <total_tokens>\n\n" +
-          "Misol: /remove_tokens 123456789 500 2000"
-      );
+      const formatText = TelegramFormatter.formatAdminTokenUsage("remove");
+      return await sendFormattedMessage(ctx, formatText, undefined, true);
     }
 
     const [, userId, dailyTokens, totalTokens] = args;
@@ -1343,51 +1048,115 @@ bot.on(message("text"), async (ctx) => {
           daily: dailyTokens,
           total: totalTokens,
         });
-        return ctx.reply(
-          `✅ Foydalanuvchi ${userId} dan tokenlar ayirildi!\n\n📊 Ayirildi:\n🔥 Kunlik: -${dailyTokens}\n💎 Umumiy: -${totalTokens}`
+        const successText = TelegramFormatter.formatTokenOperation(
+          userId,
+          parseInt(dailyTokens),
+          parseInt(totalTokens),
+          "removed"
         );
+        return await sendFormattedMessage(ctx, successText, undefined, true);
       } else {
         logger.warning(`Token remove failed`, {
           admin_id: ctx.from.id,
           user_id: userId,
           error: result.message,
         });
-        let errorMsg = `❌ ${result.message}`;
+        let errorMsg = TelegramFormatter.formatError(result.message);
         if (result.currentTokens) {
-          errorMsg += `\n\n📊 Joriy tokenlar:\n🔥 Kunlik: ${result.currentTokens.daily}\n💎 Umumiy: ${result.currentTokens.total}`;
+          errorMsg += `\n\n<b>📊 Joriy tokenlar:</b>\n🔥 Kunlik: ${result.currentTokens.daily}\n💎 Umumiy: ${result.currentTokens.total}`;
         }
-        return ctx.reply(errorMsg);
+        return await sendFormattedMessage(ctx, errorMsg, undefined, true);
       }
     } catch (error) {
-      logger.error(`Token remove error`, { error: error.message });
-      return ctx.reply(`❌ Xatolik: ${error}`);
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error(`Token remove error`, { error: errorMessage });
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError(`Xatolik: ${errorMessage}`),
+        undefined,
+        true
+      );
     }
   }
 
-  // Broadcast buyruqini tekshirish (faqat adminlar uchun)
-  if (text.startsWith("/broadcast") && ADMIN_IDS.includes(ctx.from.id)) {
+  // Add promocode command
+  if (text.startsWith("/add_promo") && ADMIN_IDS.includes(ctx.from.id)) {
     const args = text.split(" ");
-    if (args.length < 2) {
-      return ctx.reply(
-        "❌ Format: /broadcast <xabar>\n\n" + "Misol: /broadcast Salom hammaga!"
+    if (args.length !== 5) {
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError(
+          "Format: /add_promo <kod> <kunlik> <umumiy> <limit>\n\nMisol:\n/add_promo BONUS2025 1000 5000 100"
+        ),
+        undefined,
+        true
       );
     }
 
-    const message = args.slice(1).join(" ");
+    const [, code, dailyTokens, totalTokens, maxUsage] = args;
 
     try {
-      logger.broadcast(`Broadcasting via command`, {
-        admin_id: ctx.from.id,
-        message_length: message.length,
-      });
-      const successCount = await broadcastService.broadcastToAll(bot, message);
-      logger.success(`Broadcast completed via command`, { successCount });
-      return ctx.reply(
-        `✅ Broadcast yuborildi!\n\n📊 Muvaffaqiyatli: ${successCount} ta foydalanuvchi`
+      await promocodeService.createPromocode(
+        code.toUpperCase(),
+        parseInt(dailyTokens),
+        parseInt(totalTokens),
+        parseInt(maxUsage),
+        ctx.from.id
       );
+      logger.admin(`Promocode created`, {
+        admin_id: ctx.from.id,
+        code: code.toUpperCase(),
+      });
+
+      const successText = `✅ Promokod yaratildi!\n\n🎫 Kod: ${code.toUpperCase()}\n🔥 Kunlik: ${dailyTokens}\n💎 Umumiy: ${totalTokens}\n👥 Limit: ${maxUsage}`;
+      return await sendFormattedMessage(ctx, successText, undefined, true);
     } catch (error) {
-      logger.error(`Broadcast command error`, { error: error.message });
-      return ctx.reply(`❌ Broadcast yuborishda xatolik: ${error}`);
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error(`Promocode creation error`, { error: errorMessage });
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError(`Xatolik: ${errorMessage}`),
+        undefined,
+        true
+      );
+    }
+  }
+
+  // Broadcast command
+  if (text.startsWith("/broadcast") && ADMIN_IDS.includes(ctx.from.id)) {
+    const message = text.substring(10).trim();
+    if (!message) {
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError(
+          "Format: /broadcast <xabar>\n\nMisol:\n/broadcast Yangi funksiya qo'shildi!"
+        ),
+        undefined,
+        true
+      );
+    }
+
+    try {
+      const successCount = await broadcastService.broadcastToAll(bot, message);
+      logger.admin(`Broadcast sent`, {
+        admin_id: ctx.from.id,
+        success_count: successCount,
+      });
+
+      const successText = `✅ Broadcast yuborildi!\n\n📊 Muvaffaqiyatli: ${successCount} foydalanuvchi`;
+      return await sendFormattedMessage(ctx, successText, undefined, true);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error(`Broadcast error`, { error: errorMessage });
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError(`Xatolik: ${errorMessage}`),
+        undefined,
+        true
+      );
     }
   }
 
@@ -1400,6 +1169,13 @@ bot.on(message("text"), async (ctx) => {
     const isMention = text.includes(`@${ctx.botInfo.username}`);
 
     if (!isReply && !isMention) return;
+
+    logger.info(`Group interaction detected`, {
+      user_id: ctx.from.id,
+      chat_id: ctx.chat.id,
+      is_reply: isReply,
+      is_mention: isMention,
+    });
   }
 
   // Shaxsiy chatda chat mode bo'lmasa AI ga yubormaslik
@@ -1407,84 +1183,53 @@ bot.on(message("text"), async (ctx) => {
     return;
   }
 
-  // Foydalanuvchi tekshiruvi
-  const user = await userService.getUser(ctx.from.id);
-  if (!user) return;
-
-  // Ro'yxatdan o'tish tekshiruvi
-  if (!user.registration_completed) {
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback("📝 Ro'yxatdan o'tish", "start_registration")],
-      [Markup.button.callback("⏭️ O'tkazib yuborish", "skip_registration")],
-    ]);
-
-    return ctx.reply(
-      `📝 Avval ro'yxatdan o'ting yoki o'tkazib yuboring:`,
-      keyboard
-    );
-  }
-
-  // Guruhda token guruh egasidan yechiladi
-  let tokenUser = user;
-  if (isGroup) {
-    try {
-      const chatMember = await ctx.getChatMember(ctx.from.id);
-      if (
-        chatMember.status === "creator" ||
-        chatMember.status === "administrator"
-      ) {
-        // Admin yoki creator bo'lsa o'z tokenidan
-        tokenUser = user;
-      } else {
-        // Oddiy a'zo bo'lsa, guruh yaratuvchisining tokenidan
-        const chatInfo = await ctx.getChat();
-        if (chatInfo.type === "group" || chatInfo.type === "supergroup") {
-          const admins = await ctx.getChatAdministrators();
-          const creator = admins.find((admin) => admin.status === "creator");
-          if (creator) {
-            const creatorUser = await userService.getUser(creator.user.id);
-            if (creatorUser) {
-              tokenUser = creatorUser;
-            }
-          }
-        }
-      }
-    } catch (error) {
-      logger.warning(`Group token check error`, { error: error.message });
-    }
-  }
-
-  // Token tekshiruvi
-  if (
-    tokenUser.daily_used >= tokenUser.daily_tokens ||
-    tokenUser.total_used >= tokenUser.total_tokens
-  ) {
-    logger.warning(`Token limit exceeded`, {
-      user_id: tokenUser.telegram_id,
-      daily_used: tokenUser.daily_used,
-      total_used: tokenUser.total_used,
-    });
-    return ctx.reply(
-      "❌ Token limitingiz tugagan!\n\n" +
-        "💡 Admin bilan bog'laning yoki ertaga qayta urinib ko'ring.\n" +
-        `🆔 Sizning ID: ${ctx.from.id}\n` +
-        "👨‍💼 Admin: @abdulahadov_abdumutolib"
-    );
-  }
-
-  // Model tekshiruvi
-  if (!user.selected_model) {
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback("🤖 Model tanlash", "select_model")],
-    ]);
-    return ctx.reply("❌ Avval AI modelni tanlang!", keyboard);
-  }
-
   try {
+    // Foydalanuvchi tekshiruvi
+    const user = await userService.getUser(ctx.from.id);
+    if (!user) return;
+
+    // Ro'yxatdan o'tish tekshiruvi
+    if (!user.registration_completed) {
+      const keyboard = KeyboardBuilder.createRegistrationMenu();
+      return await sendFormattedMessage(
+        ctx,
+        "📝 Avval ro'yxatdan o'ting yoki o'tkazib yuboring:",
+        keyboard,
+        true
+      );
+    }
+
+    // Model tekshiruvi
+    if (!user.selected_model) {
+      const keyboard = new KeyboardBuilder()
+        .addButton("🤖 Model tanlash", "select_model")
+        .build();
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError("Avval AI modelni tanlang!"),
+        keyboard,
+        true
+      );
+    }
+
+    // Token tekshiruvi
+    if (
+      user.daily_used >= user.daily_tokens ||
+      user.total_used >= user.total_tokens
+    ) {
+      logger.warning(`Token limit exceeded`, {
+        user_id: user.telegram_id,
+        daily_used: user.daily_used,
+        total_used: user.total_used,
+      });
+      const limitText = TelegramFormatter.formatTokenLimit(ctx.from.id);
+      return await sendFormattedMessage(ctx, limitText, undefined, true);
+    }
+
     // Typing indicator
     await ctx.sendChatAction("typing");
 
-    logger.ai(`AI request in chat mode`, {
+    logger.ai(`AI request`, {
       user_id: ctx.from.id,
       model: user.selected_model,
       text_length: text.length,
@@ -1499,136 +1244,296 @@ bot.on(message("text"), async (ctx) => {
       user
     );
 
-    // Javob yuborish
+    // Javob yuborish (AI response should be plain text, no formatting)
     await ctx.reply(response.text);
 
-    // Statistika yangilash (token guruh egasidan yechiladi)
-    await statsService.updateStats(tokenUser.telegram_id, response.tokens);
+    // Statistika yangilash
+    await statsService.updateStats(user.telegram_id, response.tokens);
 
-    logger.success(`AI response sent in chat mode`, {
+    logger.success(`AI response sent`, {
       user_id: ctx.from.id,
-      token_user: tokenUser.telegram_id,
       tokens: response.tokens,
     });
   } catch (error) {
-    logger.error(`AI Error`, { user_id: ctx.from.id, error: error.message });
-    await ctx.reply("❌ Xatolik yuz berdi. Iltimos qayta urinib ko'ring.");
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error(`AI Error`, { user_id: ctx.from.id, error: errorMessage });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError(errorMessage),
+      undefined,
+      true
+    );
   }
 });
 
-// Media handler (rasm, video, gif) - faqat admin broadcast uchun
-bot.on(["photo", "video", "animation", "document"], async (ctx) => {
-  // Admin broadcast uchun media + caption tekshirish
-  if (
-    ADMIN_IDS.includes(ctx.from!.id) &&
-    ctx.message.caption?.startsWith("/broadcast")
-  ) {
-    const args = ctx.message.caption.split(" ");
-    if (args.length < 2) {
-      return ctx.reply(
-        "❌ Format: rasm/video yuborib caption sifatida /broadcast <xabar> yozing\n\n" +
-          "Misol: /broadcast Yangi xabar!"
-      );
-    }
-
-    const message = args.slice(1).join(" ");
-
-    try {
-      logger.broadcast(`Broadcasting media via command`, {
-        admin_id: ctx.from!.id,
-        message_length: message.length,
-      });
-      const successCount = await broadcastService.broadcastMediaToAll(
-        bot,
-        ctx.message,
-        message
-      );
-      logger.success(`Media broadcast completed via command`, { successCount });
-      return ctx.reply(
-        `✅ Media broadcast yuborildi!\n\n📊 Muvaffaqiyatli: ${successCount} ta foydalanuvchi`
-      );
-    } catch (error) {
-      logger.error(`Media broadcast command error`, { error: error.message });
-      return ctx.reply(`❌ Media broadcast yuborishda xatolik: ${error}`);
-    }
-  }
-
-  // Faqat admin broadcast session uchun
-  if (
-    ctx.session?.step === "broadcast_message" &&
-    ADMIN_IDS.includes(ctx.from!.id)
-  ) {
-    const type = ctx.session.data?.type;
-    const count = ctx.session.data?.count;
-    const caption = ctx.message.caption || "";
-
-    logger.broadcast(`Broadcasting media`, {
-      type,
-      count,
-      admin_id: ctx.from.id,
-      media_type: ctx.message.photo
-        ? "photo"
-        : ctx.message.video
-        ? "video"
-        : "other",
+// Action handlers
+bot.action("stats", async (ctx) => {
+  try {
+    const stats = await statsService.getUserStats(ctx.from!.id);
+    const keyboard = KeyboardBuilder.createBackButton();
+    const statsText = TelegramFormatter.formatStats({
+      user_id: ctx.from!.id,
+      daily_requests: stats.daily_requests,
+      daily_tokens: stats.daily_tokens,
+      total_requests: stats.total_requests,
+      total_tokens: stats.total_tokens,
+      created_at: stats.created_at,
     });
 
-    try {
-      let successCount = 0;
-
-      if (type === "all") {
-        successCount = await broadcastService.broadcastMediaToAll(
-          bot,
-          ctx.message,
-          caption
-        );
-      } else if (type === "active") {
-        successCount = await broadcastService.broadcastMediaToActive(
-          bot,
-          ctx.message,
-          caption
-        );
-      } else if (type === "count" && count) {
-        successCount = await broadcastService.broadcastMediaToCount(
-          bot,
-          ctx.message,
-          caption,
-          count
-        );
-      } else if (type === "groups") {
-        successCount = await broadcastService.broadcastMediaToGroups(
-          bot,
-          ctx.message,
-          caption
-        );
-      }
-
-      ctx.session = undefined;
-      logger.success(`Media broadcast completed`, {
-        successCount,
-        type,
-        count,
-      });
-      return ctx.reply(
-        `✅ Media broadcast yuborildi!\n\n📊 Muvaffaqiyatli: ${successCount} ta`
-      );
-    } catch (error) {
-      logger.error(`Media broadcast error`, { error: error.message });
-      ctx.session = undefined;
-      return ctx.reply(`❌ Media broadcast yuborishda xatolik: ${error}`);
-    }
+    await sendFormattedMessage(ctx, statsText, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Stats action error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Statistikani olishda xatolik yuz berdi."),
+      undefined,
+      true
+    );
   }
+});
 
-  // Oddiy foydalanuvchilar uchun
-  return ctx.reply(
-    "📷 Media fayllarni qayta ishlay olmayman. Faqat matn xabarlarini yuboring."
-  );
+bot.action("balance", async (ctx) => {
+  try {
+    const user = await userService.getUser(ctx.from!.id);
+    if (!user) {
+      return await sendFormattedMessage(
+        ctx,
+        TelegramFormatter.formatError("Foydalanuvchi ma'lumotlari topilmadi."),
+        undefined,
+        true
+      );
+    }
+
+    const keyboard = KeyboardBuilder.createBackButton();
+    const balanceText = TelegramFormatter.formatBalance(user);
+
+    await sendFormattedMessage(ctx, balanceText, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Balance action error", {
+      error: errorMessage,
+      user_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError("Balansni olishda xatolik yuz berdi."),
+      undefined,
+      true
+    );
+  }
+});
+
+// Admin actions - FIXED ALL MISSING HANDLERS
+bot.action("admin_panel", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    const keyboard = KeyboardBuilder.createAdminPanel();
+    await sendFormattedMessage(ctx, "⚙️ <b>Admin Panel:</b>", keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin panel error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("admin_stats", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    logger.admin(`Admin stats viewed`, { admin_id: ctx.from!.id });
+    const stats = await adminService.getSystemStats();
+
+    const keyboard = new KeyboardBuilder()
+      .addButton("⬅️ Orqaga", "admin_panel")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const statsText = TelegramFormatter.formatAdminStats(stats);
+    await sendFormattedMessage(ctx, statsText, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin stats error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+    await sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError(
+        "Admin statistikasini olishda xatolik yuz berdi."
+      ),
+      undefined,
+      true
+    );
+  }
+});
+
+// Add missing admin action handlers
+bot.action("admin_add_tokens", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    const keyboard = new KeyboardBuilder()
+      .addButton("⬅️ Orqaga", "admin_panel")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text = TelegramFormatter.formatAdminTokenUsage("add");
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin add tokens error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("admin_remove_tokens", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    const keyboard = new KeyboardBuilder()
+      .addButton("⬅️ Orqaga", "admin_panel")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text = TelegramFormatter.formatAdminTokenUsage("remove");
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin remove tokens error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("admin_promocodes", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    const keyboard = new KeyboardBuilder()
+      .addButton("⬅️ Orqaga", "admin_panel")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text =
+      "🎫 <b>Promokod boshqaruvi:</b>\n\nPromokod yaratish uchun:\n<code>/add_promo <kod> <kunlik> <umumiy> <limit></code>\n\nMisol:\n<code>/add_promo BONUS2025 1000 5000 100</code>";
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin promocodes error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("admin_broadcast", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    const keyboard = new KeyboardBuilder()
+      .addButton("⬅️ Orqaga", "admin_panel")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text =
+      "📢 <b>Broadcast boshqaruvi:</b>\n\nXabar yuborish uchun:\n<code>/broadcast <xabar></code>\n\nMisol:\n<code>/broadcast Yangi funksiya qo'shildi!</code>";
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin broadcast error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("admin_models", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    const models = await modelService.getActiveModels();
+    const keyboard = new KeyboardBuilder()
+      .addButton("⬅️ Orqaga", "admin_panel")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text = `🤖 <b>Model boshqaruvi:</b>\n\nJami faol modellar: ${
+      models.length
+    }\n\nEng mashhur modellar:\n${models
+      .slice(0, 5)
+      .map((m) => `• ${m.name}`)
+      .join("\n")}`;
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin models error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+  }
+});
+
+bot.action("admin_commands", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from!.id)) return;
+
+  try {
+    const keyboard = new KeyboardBuilder()
+      .addButton("⬅️ Orqaga", "admin_panel")
+      .addButton("🏠 Bosh sahifa", "back_to_main")
+      .build();
+
+    const text =
+      "📋 <b>Admin buyruqlari:</b>\n\n<code>/add_tokens <user_id> <daily> <total></code>\n<code>/remove_tokens <user_id> <daily> <total></code>\n<code>/add_promo <kod> <daily> <total> <limit></code>\n<code>/broadcast <xabar></code>\n<code>/admin</code> - Admin panel";
+    await sendFormattedMessage(ctx, text, keyboard);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Admin commands error", {
+      error: errorMessage,
+      admin_id: ctx.from?.id,
+    });
+  }
 });
 
 // Error handler
 bot.catch((err, ctx) => {
-  logger.error("Bot Error", { error: err.message, user_id: ctx.from?.id });
-  ctx.reply("❌ Ichki xatolik yuz berdi.");
+  const errorMessage = err instanceof Error ? err.message : "Unknown error";
+  logger.error("Bot Error", { error: errorMessage, user_id: ctx.from?.id });
+
+  try {
+    sendFormattedMessage(
+      ctx,
+      TelegramFormatter.formatError(
+        "Ichki xatolik yuz berdi. Iltimos, qayta urinib ko'ring."
+      ),
+      undefined,
+      true
+    );
+  } catch (replyError) {
+    logger.error("Failed to send error message", {
+      error: replyError instanceof Error ? replyError.message : "Unknown error",
+    });
+  }
 });
 
 // Graceful shutdown
@@ -1644,25 +1549,45 @@ process.on("SIGTERM", () => {
   bot.stop("SIGTERM");
 });
 
-// Bot ishga tushirish
-bot.launch();
+// Bot ishga tushirish with error handling
+async function startBot() {
+  try {
+    // Test bot token first
+    const botInfo = await bot.telegram.getMe();
+    logger.success("Bot token validated", {
+      bot_username: botInfo.username,
+      bot_id: botInfo.id,
+    });
 
-// Utility to split long messages for Telegram (max 4096 chars)
-function splitMessage(text: string, limit = 4096): string[] {
-  const result = [];
-  let current = text;
-  while (current.length > limit) {
-    let splitIndex = current.lastIndexOf("\n", limit);
-    if (splitIndex === -1) splitIndex = limit;
-    result.push(current.slice(0, splitIndex));
-    current = current.slice(splitIndex);
+    await bot.launch();
+
+    logger.banner();
+    logger.success("Bot started successfully", {
+      bot_username: botInfo.username,
+      admin_ids: ADMIN_IDS,
+      default_daily_tokens: process.env.DEFAULT_DAILY_TOKENS || "1000",
+      default_total_tokens: process.env.DEFAULT_TOTAL_TOKENS || "10000",
+    });
+    logger.separator();
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    logger.error("Failed to start bot", { error: errorMessage });
+
+    if (
+      errorMessage.includes("ETIMEDOUT") ||
+      errorMessage.includes("getaddrinfo ENOTFOUND")
+    ) {
+      logger.error("Network connection error. Please check:");
+      logger.error("1. Internet connection");
+      logger.error("2. Firewall settings");
+      logger.error("3. DNS resolution");
+    } else if (errorMessage.includes("401")) {
+      logger.error("Invalid bot token. Please check BOT_TOKEN in .env file");
+    }
+
+    process.exit(1);
   }
-  if (current.length) result.push(current);
-  return result;
 }
 
-// Replace all ctx.reply and ctx.editMessageText with splitMessage usage
-// Example for ctx.reply:
-// splitMessage(text).forEach(msg => ctx.reply(msg, ...args));
-// Example for ctx.editMessageText:
-// splitMessage(text).forEach((msg, i) => i === 0 ? ctx.editMessageText(msg, ...args) : ctx.reply(msg));
+startBot();

@@ -21,30 +21,37 @@ export const promocodeService = {
     maxUsage: number,
     createdBy: number
   ): Promise<void> {
-    // Promokod mavjudligini tekshirish
-    const existing = await database.get(
-      "SELECT id FROM promocodes WHERE code = ?",
-      [code]
-    );
-    if (existing) {
-      throw new Error("Bu promokod allaqachon mavjud");
+    try {
+      // Promokod mavjudligini tekshirish
+      const existing = database.get(
+        "SELECT id FROM promocodes WHERE code = ?",
+        [code]
+      );
+      if (existing) {
+        throw new Error("Bu promokod allaqachon mavjud");
+      }
+
+      database.run(
+        `
+        INSERT INTO promocodes (code, daily_tokens, total_tokens, max_usage, created_by)
+        VALUES (?, ?, ?, ?, ?)
+      `,
+        [code, dailyTokens, totalTokens, maxUsage, createdBy]
+      );
+
+      logger.admin("Promocode created", {
+        code,
+        daily_tokens: dailyTokens,
+        total_tokens: totalTokens,
+        max_usage: maxUsage,
+        created_by: createdBy,
+      });
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Error creating promocode", { error: errorMessage, code });
+      throw error;
     }
-
-    await database.run(
-      `
-      INSERT INTO promocodes (code, daily_tokens, total_tokens, max_usage, created_by)
-      VALUES (?, ?, ?, ?, ?)
-    `,
-      [code, dailyTokens, totalTokens, maxUsage, createdBy]
-    );
-
-    logger.admin(`Promocode created`, {
-      code,
-      daily_tokens: dailyTokens,
-      total_tokens: totalTokens,
-      max_usage: maxUsage,
-      created_by: createdBy,
-    });
   },
 
   async usePromocode(
@@ -55,130 +62,204 @@ export const promocodeService = {
     message: string;
     tokens?: { daily: number; total: number };
   }> {
-    // Promokodni topish
-    const promocode = await database.get(
-      `
-      SELECT * FROM promocodes 
-      WHERE code = ? AND is_active = 1
-    `,
-      [code]
-    );
+    try {
+      // Promokodni topish
+      const promocode = database.get(
+        `
+        SELECT * FROM promocodes 
+        WHERE code = ? AND is_active = 1
+      `,
+        [code]
+      );
 
-    if (!promocode) {
-      return { success: false, message: "Promokod topilmadi yoki faol emas" };
-    }
+      if (!promocode) {
+        return { success: false, message: "Promokod topilmadi yoki faol emas" };
+      }
 
-    // Ishlatish limitini tekshirish
-    if (promocode.current_usage >= promocode.max_usage) {
-      return { success: false, message: "Promokod ishlatish limiti tugagan" };
-    }
+      // Ishlatish limitini tekshirish
+      if (promocode.current_usage >= promocode.max_usage) {
+        return { success: false, message: "Promokod ishlatish limiti tugagan" };
+      }
 
-    // Foydalanuvchi avval ishlatganligini tekshirish
-    const userUsage = await database.get(
-      `
-      SELECT id FROM promocode_usage 
-      WHERE promocode_id = ? AND user_id = ?
-    `,
-      [promocode.id, userId]
-    );
+      // Foydalanuvchini topish
+      const user = database.get("SELECT id FROM users WHERE telegram_id = ?", [
+        userId,
+      ]);
+      if (!user) {
+        return { success: false, message: "Foydalanuvchi topilmadi" };
+      }
 
-    if (userUsage) {
+      // Foydalanuvchi avval ishlatganligini tekshirish
+      const userUsage = database.get(
+        `
+        SELECT id FROM promocode_usage 
+        WHERE promocode_id = ? AND user_id = ?
+      `,
+        [promocode.id, user.id]
+      );
+
+      if (userUsage) {
+        return {
+          success: false,
+          message: "Siz bu promokodni allaqachon ishlatgansiz",
+        };
+      }
+
+      // Transaction boshlanishi
+      const transaction = database.transaction(() => {
+        // Foydalanuvchiga tokenlar qo'shish
+        database.run(
+          `
+          UPDATE users SET 
+            daily_tokens = daily_tokens + ?, 
+            total_tokens = total_tokens + ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE telegram_id = ?
+        `,
+          [promocode.daily_tokens, promocode.total_tokens, userId]
+        );
+
+        // Promokod ishlatilganligini belgilash
+        database.run(
+          `
+          INSERT INTO promocode_usage (promocode_id, user_id)
+          VALUES (?, ?)
+        `,
+          [promocode.id, user.id]
+        );
+
+        // Promokod ishlatish sonini oshirish
+        database.run(
+          `
+          UPDATE promocodes SET current_usage = current_usage + 1 WHERE id = ?
+        `,
+          [promocode.id]
+        );
+      });
+
+      transaction();
+
+      logger.success("Promocode used successfully", {
+        code,
+        user_id: userId,
+        daily_tokens: promocode.daily_tokens,
+        total_tokens: promocode.total_tokens,
+      });
+
+      return {
+        success: true,
+        message: "Promokod muvaffaqiyatli ishlatildi!",
+        tokens: {
+          daily: promocode.daily_tokens,
+          total: promocode.total_tokens,
+        },
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Error using promocode", {
+        error: errorMessage,
+        code,
+        user_id: userId,
+      });
       return {
         success: false,
-        message: "Siz bu promokodni allaqachon ishlatgansiz",
+        message: "Promokod ishlatishda xatolik yuz berdi",
       };
     }
-
-    // Foydalanuvchiga tokenlar qo'shish
-    await database.run(
-      `
-      UPDATE users SET 
-        daily_tokens = daily_tokens + ?, 
-        total_tokens = total_tokens + ? 
-      WHERE telegram_id = ?
-    `,
-      [promocode.daily_tokens, promocode.total_tokens, userId]
-    );
-
-    // Promokod ishlatilganligini belgilash
-    await database.run(
-      `
-      INSERT INTO promocode_usage (promocode_id, user_id)
-      VALUES (?, (SELECT id FROM users WHERE telegram_id = ?))
-    `,
-      [promocode.id, userId]
-    );
-
-    // Promokod ishlatish sonini oshirish
-    await database.run(
-      `
-      UPDATE promocodes SET current_usage = current_usage + 1 WHERE id = ?
-    `,
-      [promocode.id]
-    );
-
-    logger.success(`Promocode used`, {
-      code,
-      user_id: userId,
-      daily_tokens: promocode.daily_tokens,
-      total_tokens: promocode.total_tokens,
-    });
-
-    return {
-      success: true,
-      message: "Promokod muvaffaqiyatli ishlatildi!",
-      tokens: { daily: promocode.daily_tokens, total: promocode.total_tokens },
-    };
   },
 
   async getAllPromocodes(): Promise<Promocode[]> {
-    return await database.all(
-      "SELECT * FROM promocodes ORDER BY created_at DESC"
-    );
+    try {
+      return database.all("SELECT * FROM promocodes ORDER BY created_at DESC");
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Error getting all promocodes", { error: errorMessage });
+      return [];
+    }
   },
 
   async getActivePromocodes(): Promise<Promocode[]> {
-    return await database.all(`
-      SELECT * FROM promocodes 
-      WHERE is_active = 1 AND current_usage < max_usage 
-      ORDER BY created_at DESC
-    `);
+    try {
+      return database.all(`
+        SELECT * FROM promocodes 
+        WHERE is_active = 1 AND current_usage < max_usage 
+        ORDER BY created_at DESC
+      `);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Error getting active promocodes", { error: errorMessage });
+      return [];
+    }
   },
 
   async togglePromocode(id: number): Promise<void> {
-    await database.run(
-      `
-      UPDATE promocodes SET is_active = NOT is_active WHERE id = ?
-    `,
-      [id]
-    );
+    try {
+      database.run(
+        `
+        UPDATE promocodes SET is_active = NOT is_active WHERE id = ?
+      `,
+        [id]
+      );
+      logger.admin("Promocode toggled", { promocode_id: id });
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Error toggling promocode", {
+        error: errorMessage,
+        promocode_id: id,
+      });
+      throw error;
+    }
   },
 
   async deletePromocode(id: number): Promise<void> {
-    await database.run("DELETE FROM promocodes WHERE id = ?", [id]);
+    try {
+      database.run("DELETE FROM promocodes WHERE id = ?", [id]);
+      logger.admin("Promocode deleted", { promocode_id: id });
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Error deleting promocode", {
+        error: errorMessage,
+        promocode_id: id,
+      });
+      throw error;
+    }
   },
 
   async getPromocodeStats(id: number): Promise<any> {
-    const promocode = await database.get(
-      "SELECT * FROM promocodes WHERE id = ?",
-      [id]
-    );
-    if (!promocode) return null;
+    try {
+      const promocode = database.get("SELECT * FROM promocodes WHERE id = ?", [
+        id,
+      ]);
+      if (!promocode) return null;
 
-    const usageHistory = await database.all(
-      `
-      SELECT u.first_name, u.telegram_id, pu.used_at
-      FROM promocode_usage pu
-      JOIN users u ON pu.user_id = u.id
-      WHERE pu.promocode_id = ?
-      ORDER BY pu.used_at DESC
-    `,
-      [id]
-    );
+      const usageHistory = database.all(
+        `
+        SELECT u.first_name, u.telegram_id, pu.used_at
+        FROM promocode_usage pu
+        JOIN users u ON pu.user_id = u.id
+        WHERE pu.promocode_id = ?
+        ORDER BY pu.used_at DESC
+      `,
+        [id]
+      );
 
-    return {
-      ...promocode,
-      usage_history: usageHistory,
-    };
+      return {
+        ...promocode,
+        usage_history: usageHistory,
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Error getting promocode stats", {
+        error: errorMessage,
+        promocode_id: id,
+      });
+      return null;
+    }
   },
 };
