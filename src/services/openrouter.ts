@@ -83,7 +83,7 @@ export const openRouterService = {
             Authorization: `Bearer ${OPENROUTER_API_KEY}`,
             "Content-Type": "application/json",
             "X-Title": "Telegram AI Bot",
-            "HTTP-Referer": "https://t.me/abbi_ai_bot"
+            "HTTP-Referer": "https://t.me/abbi_ai_bot/"
           },
           timeout: 30000, // 30 second timeout
         }
