@@ -2,7 +2,7 @@
  * Telegram formatter utility
  * Supports HTML, Markdown V2, and plain text formatting
  */
-
+import {DEFAULT_DAILY_TOKENS , DEFAULT_TOTAL_TOKENS , PREMIUM_PRICE} from './config/constants.js'
 export class TelegramFormatter {
   /**
    * Escape special characters for HTML
@@ -153,7 +153,9 @@ export class TelegramFormatter {
     return [
       `🎉 Assalomu alaykum, ${this.bold(firstName)}!`,
       "",
-      "🤖 Men AI chatbot man. Sizga turli AI modellari bilan suhbatlashishda yordam beraman.",
+      "🤖 Men AI chatbot man. Sizga turli AI modellari bilan suhbatlashishda yordam beraman.Eslatma men xatolar qilishim mumkin shuning uchun muhim ma'lumotlarni tekshiring!!!",
+      "",
+      `Sizga kunlik${dailyLimit} va oylik ${monthlyLimit} taqdim etiladi va Premium modelarga bitta so'rov yuborish imkoniyati keyin esa pro obunani sotib oling! Premium narxi: ${premiumPrice}`,
       "",
       "📝 Yaxshiroq xizmat ko'rsatish uchun qisqacha ma'lumot bering yoki o'tkazib yuboring.",
     ].join("\n");
@@ -162,11 +164,13 @@ export class TelegramFormatter {
   /**
    * Create formatted welcome message
    */
-  static formatWelcome(firstName: string, userId: number): string {
+l  static formatWelcome(firstName: string, userId: number): string {
     return [
       `🎉 Assalomu alaykum, ${this.bold(firstName)}!`,
       "",
       "🤖 Men AI chatbot man. Sizga turli AI modellari bilan suhbatlashishda yordam beraman.",
+      "",
+      `Sizga kunlik${dailyLimit} va oylik ${monthlyLimit} taqdim etiladi va Premium modelarga bitta so'rov yuborish imkoniyati keyin esa pro obunani sotib oling! Premium narxi: ${premiumPrice}`,
       "",
       "📝 Guruhda: Reply yoki @mention qiling",
       '💬 Shaxsiy chatda: "Suhbat boshlash" tugmasini bosing',
