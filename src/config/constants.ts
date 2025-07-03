@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+export const DEFAULT_MODEL = 'deepseek/deepseek-r1-0528:free';
+
 export const BOT_TOKEN: string = process.env.BOT_TOKEN as string;
 export const OPENROUTER_API_KEY: string = process.env
   .OPENROUTER_API_KEY as string;
