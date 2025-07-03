@@ -99,12 +99,16 @@ class DatabaseManager {
 
       // Barcha modellarni qo'shish
       const models = [
+        ["x-ai/grok-3-mini-beta","Grok 3 Mini","xAI", 4000],
+        ["openai/gpt-4o-mini","GPT-4o Mini","OpenAI", 4000],
+        ["google/gemini-2.5-flash-preview-05-20","Gemini 2.5 Flash","Google", 4000],
         [
           "deepseek/deepseek-chat-v3-0324:free",
           "DeepSeek Chat V3",
           "DeepSeek",
           8000,
         ],
+        
         ["deepseek/deepseek-r1-0528:free", "DeepSeek R1", "DeepSeek", 8000],
         ["deepseek/deepseek-chat:free", "DeepSeek Chat", "DeepSeek", 4000],
         ["deepseek/deepseek-r1:free", "DeepSeek R1 Base", "DeepSeek", 8000],
