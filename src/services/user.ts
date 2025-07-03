@@ -3,6 +3,7 @@ import { User } from "../types/bot.js";
 import {
   DEFAULT_DAILY_TOKENS,
   DEFAULT_TOTAL_TOKENS,
+  DEFAULT_MODEL,
 } from "../config/constants.js";
 import { logger } from "../utils/logger.js";
 
@@ -27,14 +28,22 @@ export const userService = {
           existingUser.daily_used = 0;
         }
 
+        if (!existingUser.selected_model) {
+          database.run(
+            "UPDATE users SET selected_model = ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?",
+            [DEFAULT_MODEL, telegramUser.id]
+          );
+          existingUser.selected_model = DEFAULT_MODEL;
+        }
+          
         return existingUser;
       }
 
       // Yangi foydalanuvchi yaratish
       database.run(
         `
-        INSERT INTO users (telegram_id, username, first_name, last_name, daily_tokens, total_tokens, daily_used, total_used, is_active, registration_completed)
-        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1, 0)
+        INSERT INTO users (telegram_id, username, first_name, last_name, daily_tokens, total_tokens, daily_used, total_used, is_active, registration_completed, selected_model)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1, 0, ?)
       `,
         [
           telegramUser.id,
@@ -43,6 +52,7 @@ export const userService = {
           telegramUser.last_name || null,
           DEFAULT_DAILY_TOKENS,
           DEFAULT_TOTAL_TOKENS,
+          DEFAULT_MODEL,
         ]
       );
 
