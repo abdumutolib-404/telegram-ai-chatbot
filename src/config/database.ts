@@ -109,7 +109,7 @@ class DatabaseManager {
           8000,
         ],
         
-        ["deepseek/deepseek-r1-0528:free", "DeepSeek R1", "DeepSeek", 8000],
+        ["deepseek/deepseek-r1-0528:free", "DeepSeek R1", "DeepSeek", 18000],
         ["deepseek/deepseek-chat:free", "DeepSeek Chat", "DeepSeek", 4000],
         ["deepseek/deepseek-r1:free", "DeepSeek R1 Base", "DeepSeek", 8000],
         [
