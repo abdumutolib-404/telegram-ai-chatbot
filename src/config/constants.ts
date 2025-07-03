@@ -15,6 +15,8 @@ if (!OPENROUTER_API_KEY) {
   throw new Error("OPENROUTER_API_KEY is required in environment variables");
 }
 
+export const PREMIUM_PRICE: number = process.env.PREMIUM_PRICE || "8000";
+
 // Admin IDs ni .env dan olish
 export const ADMIN_IDS: number[] = process.env.ADMIN_IDS
   ? process.env.ADMIN_IDS.split(",")
