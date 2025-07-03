@@ -19,7 +19,7 @@ export interface User {
   total_tokens: number;
   daily_used: number;
   total_used: number;
-  selected_model?: string;
+  selected_model: string;
   is_active: boolean;
   registration_completed: boolean;
   created_at: string;
